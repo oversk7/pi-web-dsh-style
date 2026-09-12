@@ -1,0 +1,74 @@
+{
+  "name": "@oversk7/pi-web-dsh-style",
+  "version": "1.0.1",
+  "description": "An unofficial DSH-styled Windows browser UI for pi coding agent with configurable LAN and native frp relay access",
+  "type": "module",
+  "license": "MIT",
+  "author": "oversk7",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "web-ui",
+    "dsh",
+    "deepseek-harness",
+    "windows"
+  ],
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "abort-session.ts",
+    "attachment-store.ts",
+    "file-preview.ts",
+    "index.ts",
+    "local-session.ts",
+    "network-access.ts",
+    "network-settings.ts",
+    "frp-process.ts",
+    "pi-rpc.ts",
+    "sse-channel.ts",
+    "server.ts",
+    "state-store.ts",
+    "transcript.ts",
+    "windows-clipboard.ts",
+    "windows-rpc-job.ps1",
+    "web/",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "check:package": "node scripts/check-package.mjs",
+    "verify": "npm run typecheck && npm test && npm run check:package",
+    "prepack": "npm run verify"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.0",
+    "@earendil-works/pi-coding-agent": "0.85.0",
+    "@earendil-works/pi-server": "0.85.0",
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org",
+    "tag": "latest"
+  },
+  "dependencies": {
+    "highlight.js": "^11.12.0"
+  }
+}

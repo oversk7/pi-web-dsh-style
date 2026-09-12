@@ -1,0 +1,5 @@
+node_modules/
+*.tgz
+*.tmp
+state.json
+.pi-web-test/
