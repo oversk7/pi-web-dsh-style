@@ -64,10 +64,12 @@ test("settings keyboard navigation wraps and supports Home and End", () => {
 test("remote settings keep appearance and maintenance available without local credential forms", () => {
   const html = runInContext(`${escapeSource}\n${settingsSource}\nrenderSettings()`, createContext({
     S: { localClient: false, settingsTab: "security", theme: "dark" },
-    ICONS: {}, matchMedia: () => ({ matches: true }),
+    ICONS: {}, matchMedia: () => ({ matches: true }), getLanguage: () => "zh-CN",
   }));
   assert.doesNotMatch(html, /id="webPasswordForm"|id="webNetworkMount"|id="webTerminalProxyMount"/);
   assert.match(html, /data-action="maintenance-reload"/);
+  assert.match(html, /data-action="choose-language" data-language="zh-CN" aria-pressed="true"/);
+  assert.match(html, /data-action="choose-language" data-language="en" aria-pressed="false"/);
   assert.match(html, /data-theme="dark" aria-pressed="true"/);
   assert.match(html, /id="pi-settings-tab-security"[^>]*aria-selected="true"/);
   assert.match(html, /aria-orientation="horizontal"/);

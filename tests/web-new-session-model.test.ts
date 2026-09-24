@@ -22,7 +22,8 @@ function harness(post: (path: string, body?: any) => Promise<any>) {
   const alerts: string[] = [];
   const storage = new Map<string, string>();
   const context = createContext({
-    S: state, post,
+    S: state, post, t: (text: string) => text,
+    $() { return null; },
     closeMobileSidebar() {}, closeCommandMenu() {}, renderSidebar() {}, queueRender() {},
     renderConversation() { renders.push({ id: state.currentSessionId, draft: state.draft, pending: !!state.pendingCreation, tab: state.conversationTab }); },
     sessionStorage: { setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) },
@@ -86,6 +87,76 @@ test("creation renders an empty pending view before POST settles, blocks duplica
   assert.equal(h.state.currentSessionId, "created");
   assert.equal(h.state.drafts.get("new:ws"), "saved empty-composer draft");
   assert.equal(h.state.pendingCreation, null);
+});
+
+test("typing during creation is retained when the session becomes ready", async () => {
+  const pending = deferred();
+  const h = harness(async () => pending.promise);
+  const creation = h.create();
+  runInContext('setDraftValue("提前输入的内容")', h.context);
+  pending.resolve(snapshot("created"));
+  await creation;
+  assert.equal(h.state.draft, "提前输入的内容");
+  assert.equal(h.state.drafts.get("session:created"), "提前输入的内容");
+  assert.equal(h.state.loadingSession, null);
+});
+
+test("sending the first message preserves edits made while startup is pending", async () => {
+  const pending = deferred();
+  const sent: any[] = [];
+  const started = deferred();
+  const h = harness(async (path, body) => {
+    if (path.endsWith("/sessions")) {
+      started.resolve(null);
+      return pending.promise;
+    }
+    sent.push(body);
+    return {};
+  });
+  h.state.currentSessionId = null;
+  h.state.draftAttachments = [];
+  Object.assign(h.state, { pendingSends: new Map() });
+  Object.assign(h.context, {
+    executeLocalSlashCommand: async () => false,
+    currentWorkspace: () => ({ id: "ws" }),
+    clearComposerDraft() { h.state.draft = ""; },
+  });
+  runInContext(app.slice(app.indexOf("async function sendDraft("), app.indexOf("async function sendDraft(") + app.slice(app.indexOf("async function sendDraft(")).indexOf("\nasync function ", 1)), h.context);
+  const sending = runInContext("sendDraft()", h.context);
+  await started.promise;
+  assert.ok(h.state.pendingCreation);
+  runInContext('setDraftValue("new edits during startup")', h.context);
+  pending.resolve(snapshot("created"));
+  await sending;
+  assert.equal(sent[0].message, "old draft");
+  assert.equal(h.state.draft, "new edits during startup");
+  assert.equal(h.state.drafts.get("session:created"), "new edits during startup");
+});
+
+test("pending composer allows typing while sending stays disabled", () => {
+  const h = harness(async () => snapshot("created"));
+  h.state.currentSessionId = null;
+  h.state.pendingCreation = { generation: 0 };
+  Object.assign(h.context, {
+    currentSnapshot: () => ({}), esc: (value: string) => value,
+    renderCommandMenu: () => "", renderDraftAttachments: () => "",
+    modelSupportsImages: () => false, thinkingLabel: () => "off", ICONS: {},
+  });
+  runInContext(app.slice(app.indexOf("function renderComposerBar("), app.indexOf("function renderComposer(")), h.context);
+  const html = runInContext("renderComposerBar(true)", h.context);
+  assert.doesNotMatch(html.match(/<textarea[^>]*>/)[0], /disabled/);
+  assert.match(html.match(/<button[^>]*data-action="send"[^>]*>/)[0], /disabled/);
+});
+
+test("failed startup retains newly typed text in the new-session draft", async () => {
+  const pending = deferred();
+  const h = harness(async () => pending.promise);
+  const creation = h.create();
+  runInContext('setDraftValue("保留输入")', h.context);
+  pending.reject(new Error("startup failed"));
+  await creation;
+  assert.equal(h.state.draft, "old draft");
+  assert.equal(h.state.drafts.get("new:ws"), "保留输入");
 });
 
 test("keepDraft carries text and attachments into the created session", async () => {

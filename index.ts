@@ -165,6 +165,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    if (ctx.mode === "rpc") await ctx.modelRegistry.refresh({ allowNetwork: false });
     const resumeAfterReload = reloadState.resumeWebAfterReload;
     const connection = reloadState.connection;
     reloadState.resumeWebAfterReload = false;

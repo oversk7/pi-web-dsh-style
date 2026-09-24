@@ -2,6 +2,7 @@
 
 import { markdown } from "./assets/markdown.js";
 import { webSlashCommands, unsupportedSlashCommands, parseSlashCommand } from "./slash-commands.js";
+import { getLanguage, setLanguage, t, translateUi, observeUi } from "./i18n.js";
 
 const SESSION_PREVIEW_LIMIT = 5;
 const MODEL_REFRESH_TTL_MS = 60_000;
@@ -113,11 +114,11 @@ function timeLabel(iso) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "";
   const diff = Date.now() - date.getTime();
-  if (diff < 60_000) return "刚刚";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}分钟`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}小时`;
-  if (diff < 7 * 86_400_000) return `${Math.floor(diff / 86_400_000)}天`;
-  return date.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+  if (diff < 60_000) return t("刚刚");
+  if (diff < 3_600_000) return t(`${Math.floor(diff / 60_000)}分钟`);
+  if (diff < 86_400_000) return t(`${Math.floor(diff / 3_600_000)}小时`);
+  if (diff < 7 * 86_400_000) return t(`${Math.floor(diff / 86_400_000)}天`);
+  return date.toLocaleDateString(getLanguage(), { month: "short", day: "numeric" });
 }
 
 function sessionsByRecency(workspace) {
@@ -130,7 +131,7 @@ function clockLabel(timestamp) {
   if (!timestamp) return "";
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return date.toLocaleTimeString(getLanguage(), { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 function shortPath(path, max = 34) {
@@ -832,7 +833,7 @@ function renderCommandMenu(snap = currentSnapshot()) {
   const rows = commands.map((command, index) => `<button type="button" role="option" aria-selected="${index === S.commandSelected}" class="_3e4SsG_item ${index === S.commandSelected ? "_3e4SsG_active" : ""}" data-action="choose-command" data-command="${esc(command.name)}">
     <span class="_3e4SsG_itemIcon">/</span>
     <span class="_3e4SsG_itemName">${esc(command.name)}</span>
-    <span class="_3e4SsG_itemDescription">${esc(command.description || commandSourceLabel(command.source))}</span>
+    <span class="_3e4SsG_itemDescription">${esc(t(command.description || commandSourceLabel(command.source)))}</span>
     <span class="pi-commandSource">${esc(commandSourceLabel(command.source))}</span>
   </button>`).join("");
   const status = S.commandLoading && commands.length === 0
@@ -867,7 +868,8 @@ function renderComposerBar(hero = false) {
   const level = state.thinkingLevel || null;
   const streaming = Boolean(snap.session?.streaming);
   const waitingForDialog = Boolean(snap.dialogs?.length);
-  const disabled = (!S.currentSessionId && !hero) || Boolean(S.loadingSession && !hero) || S.pendingCreation?.generation === S.openGeneration || waitingForDialog;
+  const inputDisabled = (!S.currentSessionId && !hero) || Boolean(S.loadingSession && !hero) || waitingForDialog;
+  const disabled = inputDisabled || S.pendingCreation?.generation === S.openGeneration;
   const inputPlaceholder = waitingForDialog ? "请先回答对话中的问题" : "给智能体发消息";
   const rawContextPct = snap.stats?.contextUsage?.percent;
   const hasContextPct = typeof rawContextPct === "number" && Number.isFinite(rawContextPct);
@@ -880,7 +882,7 @@ function renderComposerBar(hero = false) {
           ${renderDraftAttachments(model)}
           <div class="uV2eYG_scroll" data-input-scroll="true"><div class="uV2eYG_grow">
             <div aria-hidden="true" class="uV2eYG_backdrop"></div>
-            <textarea class="uV2eYG_input" id="composerInput" data-phase="plain" data-session-id="${esc(S.currentSessionId || "")}" placeholder="${inputPlaceholder}" rows="1" ${disabled ? "disabled" : ""}></textarea>
+            <textarea class="uV2eYG_input" id="composerInput" data-phase="plain" data-session-id="${esc(S.currentSessionId || "")}" placeholder="${inputPlaceholder}" rows="1" ${inputDisabled ? "disabled" : ""}></textarea>
             <div aria-hidden="true" class="uV2eYG_mirror"></div>
           </div></div>
           <div class="uV2eYG_row">
@@ -891,7 +893,7 @@ function renderComposerBar(hero = false) {
             <div class="uV2eYG_trailing">
               <div class="_7KE1Ra_root pi-modelControl">
                 <button type="button" class="_7KE1Ra_trigger" aria-haspopup="menu" aria-expanded="false" title="选择模型" data-action="model-menu" ${disabled ? "disabled" : ""}>
-                  <span class="_7KE1Ra_triggerLabel">${esc(modelLabel(model))}</span>
+                  <span class="_7KE1Ra_triggerLabel">${esc(model?.name || model?.id || "选择模型")}</span>
                   <svg width="14" height="14" class="_7KE1Ra_chevron" viewBox="0 0 14 14" fill="none"><path d="M11.85 5.5L11.42 5.92L8.7 8.65C8.44 8.91 8.22 9.13 8.01 9.3C7.8 9.47 7.56 9.62 7.25 9.67C7.08 9.69 6.92 9.69 6.75 9.67C6.44 9.62 6.2 9.47 5.99 9.3C5.78 9.13 5.56 8.91 5.3 8.65L2.58 5.92L2.15 5.5L3 4.65L3.42 5.08L6.15 7.8C6.43 8.08 6.6 8.25 6.74 8.36C6.87 8.47 6.92 8.48 6.94 8.48C6.98 8.49 7.02 8.49 7.06 8.48C7.08 8.48 7.13 8.47 7.26 8.36C7.4 8.25 7.57 8.08 7.85 7.8L10.58 5.08L11 4.65L11.85 5.5Z" fill="currentColor"/></svg>
                 </button>
               </div>
@@ -1495,7 +1497,11 @@ function renderConversation() {
   }
   if (!patchedActive) {
     const nextInput = $("#composerInput");
-    if (previousInput && nextInput && previousInput.dataset.sessionId === nextInput.dataset.sessionId) {
+    const completingCreation = !previousSessionId && S.pendingCreation?.sessionId === S.currentSessionId;
+    if (previousInput && nextInput && (previousInput.dataset.sessionId === nextInput.dataset.sessionId || completingCreation)) {
+      previousInput.dataset.sessionId = nextInput.dataset.sessionId;
+      previousInput.disabled = nextInput.disabled;
+      previousInput.placeholder = nextInput.placeholder;
       nextInput.replaceWith(previousInput);
     }
     restoreDraft();
@@ -2320,7 +2326,7 @@ async function navigateHistory(entryId, role, restoreMode) {
   if (!view || !sessionId || view.busyEntryId) return;
   if (S.draft.trim()) {
     const replacesDraft = role === "user" || role === "custom";
-    if (!confirm(replacesDraft ? "当前输入框草稿将被历史消息替换，继续回溯？" : "切换会话节点将清空当前输入框草稿，继续？")) return;
+    if (!confirm(t(replacesDraft ? "当前输入框草稿将被历史消息替换，继续回溯？" : "切换会话节点将清空当前输入框草稿，继续？"))) return;
   }
   S.historyView = { ...view, busyEntryId: entryId, busyRestoreMode: restoreMode || null, error: null };
   renderConversation();
@@ -2680,7 +2686,7 @@ function renderSettings() {
       <div class="pi-settingsPageHeading"><h3>${tab.title}</h3><p>${tab.description}</p></div>`;
   };
   const status = S.maintenanceMessage
-    ? `<div class="pi-settingsStatus pi-settingsStatus-${esc(S.maintenanceMessage.type || "info")}" role="status">${esc(S.maintenanceMessage.text || "")}</div>`
+    ? `<div class="pi-settingsStatus pi-settingsStatus-${esc(S.maintenanceMessage.type || "info")}" role="status">${esc(t(S.maintenanceMessage.text || ""))}</div>`
     : "";
   return `<div class="pi-settingsBackdrop">
     <div class="pi-settingsPanel" role="dialog" aria-modal="true" aria-labelledby="pi-settings-title">
@@ -2697,7 +2703,11 @@ function renderSettings() {
         </aside>
         <div class="pi-settingsContent">
           ${pageStart("appearance")}
-            <div class="pi-settingsGroupHeading"><h4>主题风格</h4><span>即时生效</span></div>
+            <div class="pi-settingsGroupHeading"><h4>界面语言</h4><span>即时生效</span></div>
+            <div class="pi-languageChoices" role="group" aria-label="界面语言">
+              ${[["zh-CN", "中文"], ["en", "English"]].map(([value, label]) => `<button type="button" data-action="choose-language" data-language="${value}" aria-pressed="${getLanguage() === value}">${label}${getLanguage() === value ? ICONS.check : ""}</button>`).join("")}
+            </div>
+            <div class="pi-settingsGroupHeading pi-themeModeHeading"><h4>主题风格</h4><span>即时生效</span></div>
             <div class="pi-settingsTheme pi-settingsStyles" role="group" aria-label="主题风格">
               ${styles.map(([value, label, description]) => `<button type="button" data-action="choose-theme-style" data-theme-style="${value}" aria-pressed="${(S.themeStyle || "classic") === value}" ${busy ? "disabled" : ""}>
                 <span class="pi-stylePreview pi-stylePreview-${value}" aria-hidden="true"><span class="pi-stylePreviewWindow"><i></i><i></i><i></i></span></span>
@@ -2806,6 +2816,7 @@ function renderOverlay() {
     }
     const nextFocus = focused?.isConnected ? focused
       : focused?.dataset.settingsTab ? $(`[data-settings-tab="${focused.dataset.settingsTab}"]`, overlay)
+      : focused?.dataset.language ? $(`[data-language="${focused.dataset.language}"]`, overlay)
       : focused?.dataset.theme ? $(`[data-theme="${focused.dataset.theme}"]`, overlay)
       : focused?.dataset.themeStyle ? $(`[data-theme-style="${focused.dataset.themeStyle}"]`, overlay)
       : focused?.dataset.action ? $(`[data-action="${focused.dataset.action}"]`, overlay) : null;
@@ -3012,7 +3023,7 @@ async function openSession(id, opts = {}) {
   if (!opts.skipRemember) rememberCurrentDraft();
   const generation = ++S.openGeneration;
   S.currentSessionId = id;
-  S.loadingSession = id;
+  S.loadingSession = opts.initialSnapshot ? null : id;
   if (!opts.silent) {
     const key = draftKey(id);
     const savedDraft = S.drafts.get(key) || "";
@@ -3071,6 +3082,7 @@ async function createAndOpenSession(workspaceId, title, options = {}) {
   }
   renderSidebar();
   renderConversation();
+  $("#composerInput")?.focus({ preventScroll: true });
   try {
     const model = source?.state?.model;
     const data = await post(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions`, {
@@ -3090,10 +3102,21 @@ async function createAndOpenSession(workspaceId, title, options = {}) {
       return null;
     }
     S.newSessionPreferenceWorkspaceId = null;
+    pending.sessionId = id;
     await openSession(id, { silent: true, skipRemember: true, initialSnapshot: data });
     return generation + 1 === S.openGeneration && S.currentSessionId === id ? id : null;
   } catch (error) {
     if (generation === S.openGeneration) {
+      // Keep anything typed during startup available in the workspace's new-session draft.
+      rememberCurrentDraft();
+      const pendingDraft = S.drafts.get(pending.draftKey);
+      if (pendingDraft) S.drafts.set(`new:${workspaceId || "default"}`, pendingDraft);
+      const pendingAttachments = S.attachmentDrafts.get(pending.draftKey);
+      if (pendingAttachments) S.attachmentDrafts.set(`new:${workspaceId || "default"}`, pendingAttachments);
+      if (!previous.sessionId && S.currentWorkspaceId === previous.workspaceId) {
+        previous.draft = S.draft;
+        previous.attachments = [...S.draftAttachments];
+      }
       S.pendingCreation = null;
       S.currentSessionId = previous.sessionId;
       S.currentWorkspaceId = previous.workspaceId;
@@ -3105,7 +3128,7 @@ async function createAndOpenSession(workspaceId, title, options = {}) {
       if (previous.sessionId) sessionStorage.setItem("pi-web-current-session", previous.sessionId);
       renderSidebar();
       renderConversation();
-      alert(`新建会话失败：${error.message}`);
+      alert(t(`新建会话失败：${error.message}`));
     }
     return null;
   } finally {
@@ -3585,7 +3608,7 @@ async function copyText(value) {
 let toastTimer = 0;
 function showToast(message, type = "info") {
   $(".pi-toast")?.remove();
-  const toast = el(`<div class="pi-toast pi-toast-${esc(type)}" role="status">${esc(message)}</div>`);
+  const toast = el(`<div class="pi-toast pi-toast-${esc(type)}" role="status">${esc(t(message))}</div>`);
   document.body.appendChild(toast);
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.remove(), 3600);
@@ -3966,7 +3989,7 @@ async function executeLocalSlashCommand(text) {
   const parsed = parseSlashCommand(text);
   if (!parsed) return false;
   const { name, args } = parsed;
-  if (Object.hasOwn(unsupportedSlashCommands, name)) throw new Error(unsupportedSlashCommands[name]);
+  if (Object.hasOwn(unsupportedSlashCommands, name)) throw new Error(t(unsupportedSlashCommands[name]));
   const command = WEB_SLASH_COMMANDS.find((command) => command.name === name);
   if (!command) return false;
   if (args && !command.acceptsArgs) throw new Error(`/${name} 不接受参数${name === "export" ? "，Web 会将 HTML 文件下载到浏览器下载目录" : ""}`);
@@ -4053,12 +4076,15 @@ async function executeLocalSlashCommand(text) {
     const stats = snap.stats || {};
     const tokens = stats.tokens || {};
     const cu = stats.contextUsage || {};
+    const colon = getLanguage() === "en" ? ": " : "：";
+    const openParen = getLanguage() === "en" ? "(" : "（";
+    const closeParen = getLanguage() === "en" ? ")" : "）";
     alert([
-      `会话：${snap.session?.title || "新会话"}`,
-      `路径：${snap.session?.cwd || "-"}`,
-      `模型：${snap.state?.model?.provider || "-"}/${snap.state?.model?.id || "-"} · 思考 ${thinkingLabel(snap.state?.thinkingLevel || "off")}`,
-      `上下文：${fmtNum(cu.tokens ?? 0)} / ${fmtNum(cu.contextWindow ?? 0)} tok（${Math.round(cu.percent ?? 0)}%）`,
-      `输入 ${fmtNum(tokens.input ?? 0)} · 输出 ${fmtNum(tokens.output ?? 0)} tok · 成本 ${typeof stats.cost === "number" ? formatCost(stats.cost) : "-"}`,
+      `${t("会话")}${colon}${snap.session?.title || t("新会话")}`,
+      `${t("路径")}${colon}${snap.session?.cwd || "-"}`,
+      `${t("模型")}${colon}${snap.state?.model?.provider || "-"}/${snap.state?.model?.id || "-"} · ${t("思考")} ${thinkingLabel(snap.state?.thinkingLevel || "off")}`,
+      `${t("上下文")}${colon}${fmtNum(cu.tokens ?? 0)} / ${fmtNum(cu.contextWindow ?? 0)} tok${openParen}${Math.round(cu.percent ?? 0)}%${closeParen}`,
+      `${t("输入")} ${fmtNum(tokens.input ?? 0)} · ${t("输出")} ${fmtNum(tokens.output ?? 0)} tok · ${t("成本")} ${typeof stats.cost === "number" ? formatCost(stats.cost) : "-"}`,
     ].join("\n"));
   }
   if (S.currentSessionId === sessionId && S.draft.trim() === text.trim()) clearComposerDraft();
@@ -4104,7 +4130,9 @@ async function sendDraft() {
     sessionId = await createAndOpenSession(S.currentWorkspaceId || currentWorkspace().id, title, { keepDraft: true });
     if (!sessionId) return;
   }
-  clearComposerDraft({ attachments: true });
+  // Startup can take a while; edits made after Send belong to the next draft.
+  if (S.draft.trim() === text) clearComposerDraft();
+  setDraftAttachments(S.draftAttachments.filter((attachment) => !attachments.some((sent) => sent.id === attachment.id)));
   S.pendingSends.set(sessionId, (S.pendingSends.get(sessionId) || 0) + 1);
   queueRender(true);
   try {
@@ -4498,6 +4526,13 @@ async function onClick(ev) {
       S.maintenanceMessage = null;
       renderOverlay();
     }
+  } else if (action === "choose-language") {
+    setLanguage(target.dataset.language);
+    closePopovers();
+    queueRender(true);
+    renderFilePreview();
+    if (browser) renderBrowser();
+    translateUi();
   } else if (action === "choose-theme") {
     setTheme(target.dataset.theme || "system");
     renderOverlay();
@@ -4687,7 +4722,7 @@ async function onClick(ev) {
       showToast(error.message || String(error), "error");
     }
   } else if (action === "rename-session") {
-    const name = prompt("会话名称：", snapshotFor(sessionId).session?.title || "");
+    const name = prompt(t("会话名称："), snapshotFor(sessionId).session?.title || "");
     if (name && sessionId) {
       await post(`/api/sessions/${encodeURIComponent(sessionId)}/set_name`, { name });
       closePopovers();
@@ -4704,7 +4739,7 @@ async function onClick(ev) {
     }
   } else if (action === "remove-session") {
     if (!sessionId) return;
-    if (!confirm("永久删除这个会话？磁盘上的 pi 会话文件也会被删除，此操作不可撤销。")) return;
+    if (!confirm(t("永久删除这个会话？磁盘上的 pi 会话文件也会被删除，此操作不可撤销。"))) return;
     const ws = S.workspaces.find((w) => w.sessions?.some((s) => s.id === sessionId));
     if (ws) {
       try {
@@ -4787,21 +4822,23 @@ async function onClick(ev) {
   } else if (action === "context-info") {
     const stats = currentSnapshot().stats;
     if (!stats) {
-      alert("暂无统计");
+      alert(t("暂无统计"));
       return;
     }
     const tokens = stats.tokens || {};
     const cu = stats.contextUsage || {};
     const hasContextUsage = typeof cu.tokens === "number" && Number.isFinite(cu.tokens)
       && typeof cu.contextWindow === "number" && Number.isFinite(cu.contextWindow) && cu.contextWindow > 0;
+    const openParen = getLanguage() === "en" ? "(" : "（";
+    const closeParen = getLanguage() === "en" ? ")" : "）";
     const contextLine = hasContextUsage
-      ? `上下文 ${fmtNum(cu.tokens)} / ${fmtNum(cu.contextWindow)} tok（${Math.round(cu.percent ?? 0)}%）`
-      : cu.contextWindow ? `上下文占用待更新 / ${fmtNum(cu.contextWindow)} tok` : "上下文占用暂无统计";
+      ? `${t("上下文")} ${fmtNum(cu.tokens)} / ${fmtNum(cu.contextWindow)} tok${openParen}${Math.round(cu.percent ?? 0)}%${closeParen}`
+      : cu.contextWindow ? `${t("上下文占用待更新")} / ${fmtNum(cu.contextWindow)} tok` : t("上下文占用暂无统计");
     const lines = [
       contextLine,
-      `输入 ${fmtNum(tokens.input ?? 0)} · 输出 ${fmtNum(tokens.output ?? 0)} · 缓存读 ${fmtNum(tokens.cacheRead ?? 0)} · 缓存写 ${fmtNum(tokens.cacheWrite ?? 0)} tok`,
-      `消息 ${stats.totalMessages ?? "?"}（用户 ${stats.userMessages ?? "?"} / 助手 ${stats.assistantMessages ?? "?"} / 工具 ${stats.toolCalls ?? "?"}）`,
-      typeof stats.cost === "number" ? `成本 ${formatCost(stats.cost)}` : "",
+      `${t("输入")} ${fmtNum(tokens.input ?? 0)} · ${t("输出")} ${fmtNum(tokens.output ?? 0)} · ${t("缓存读")} ${fmtNum(tokens.cacheRead ?? 0)} · ${t("缓存写")} ${fmtNum(tokens.cacheWrite ?? 0)} tok`,
+      `${t("消息")} ${stats.totalMessages ?? "?"}${openParen}${t("用户")} ${stats.userMessages ?? "?"} / ${t("助手")} ${stats.assistantMessages ?? "?"} / ${t("工具")} ${stats.toolCalls ?? "?"}${closeParen}`,
+      typeof stats.cost === "number" ? `${t("成本")} ${formatCost(stats.cost)}` : "",
     ].filter(Boolean);
     alert(lines.join("\n"));
   } else if (action === "view-options") {
@@ -4813,7 +4850,7 @@ async function onClick(ev) {
       <button type="button" role="menuitem" class="_7KE1Ra_cell" data-action="settings"><span class="_7KE1Ra_cellLabel">设置</span></button>
     </div>`);
   } else if (action === "pi-agent-chip") {
-    alert("该 Web UI 由 pi coding agent 的 RPC 会话驱动。");
+    alert(t("该 Web UI 由 pi coding agent 的 RPC 会话驱动。"));
   } else if (action === "upload-files") {
     selectAttachmentFiles();
   } else if (action === "workspace-menu") {
@@ -4831,7 +4868,7 @@ async function onClick(ev) {
     closePopovers();
     queueRender(true);
   } else if (action === "remove-workspace") {
-    if (!confirm("从侧边栏移除该工作区？磁盘上的会话文件会保留。")) return;
+    if (!confirm(t("从侧边栏移除该工作区？磁盘上的会话文件会保留。"))) return;
     await api(`/api/workspaces/${encodeURIComponent(target.dataset.workspace)}`, { method: "DELETE" });
     await refreshWorkspaces();
     const currentStillExists = S.workspaces.some((w) => w.sessions?.some((s) => s.id === S.currentSessionId));
@@ -5167,6 +5204,8 @@ window.addEventListener("online", () => { if (eventSource && !loginPromise) conn
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && eventSource && !loginPromise) connectEvents();
 });
+setLanguage(getLanguage());
+observeUi();
 setTheme(S.theme);
 setThemeStyle(S.themeStyle);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {

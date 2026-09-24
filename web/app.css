@@ -499,6 +499,10 @@ body[data-workspace-dragging] .YDXeBa_projectRow[draggable=true]{cursor:grabbing
 .pi-settingsEmpty{display:flex;flex-direction:column;align-items:center;gap:12px;padding:32px 20px;text-align:center}
 .pi-settingsEmpty strong{font-size:14px;font-weight:500}
 .pi-settingsEmptyIcon{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary)}
+.pi-languageChoices{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:28px}
+.pi-languageChoices button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:104px;min-height:36px;padding:6px 12px;border:1px solid var(--dsw-alias-border-l2);border-radius:6px;background:transparent;color:var(--dsw-alias-label-primary);cursor:pointer;font:inherit;font-size:12px}
+.pi-languageChoices button[aria-pressed=true]{border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-state-business-primary)}
+.pi-languageChoices button svg{width:14px;height:14px}
 .pi-settingsTheme{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .pi-settingsTheme button{min-width:0;padding:7px;border:1px solid var(--dsw-alias-border-l2);border-radius:11px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font:inherit;font-size:12px;line-height:20px;transition:border-color .15s,box-shadow .15s}
 .pi-settingsTheme button:hover:not(:disabled){border-color:var(--dsw-alias-label-tertiary);color:var(--dsw-alias-label-primary)}

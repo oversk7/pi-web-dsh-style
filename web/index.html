@@ -13,6 +13,7 @@
   <body>
     <script>
       (() => {
+        document.documentElement.lang = localStorage.getItem("pi-web-language") === "en" ? "en" : "zh-CN";
         const saved = localStorage.getItem("pi-web-theme");
         const preference = ["light", "dark", "system"].includes(saved) ? saved : "system";
         const style = localStorage.getItem("pi-web-theme-style");

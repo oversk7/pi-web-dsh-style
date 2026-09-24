@@ -14,7 +14,7 @@ for (const confirmed of [false, true]) {
     };
     let requests = 0;
     await runInNewContext(`${source}\nnavigateHistory("answer", "assistant", "conversation")`, {
-      S: state,
+      S: state, t: (text: string) => text,
       confirm: (message: string) => {
         assert.match(message, /清空当前输入框草稿/);
         return confirmed;
