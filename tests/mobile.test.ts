@@ -38,16 +38,20 @@ test("reconnection refreshes content without adopting another client's selection
   let networkRefreshes = 0;
   await runInNewContext(`${resyncSource}\nresyncAfterReconnect()`, {
     S: state,
+    AbortSignal,
     networkSettings: { data: {} },
+    terminalProxySettings: { data: null },
     loadNetworkSettings: async () => { networkRefreshes += 1; },
-    api: async () => ({ currentSessionId: "desktop", workspaces: [{ id: "ws", sessions: [{ id: "phone" }, { id: "desktop" }] }] }),
-    applySavedWorkspaceOrder: (value: unknown) => value,
-    post: async (path: string) => {
+    api: async (path: string, options: RequestInit) => {
+      assert.ok(options.signal);
+      if (path === "/api/bootstrap") return { currentSessionId: "desktop", workspaces: [{ id: "ws", sessions: [{ id: "phone" }, { id: "desktop" }] }] };
       assert.equal(path, "/api/sessions/phone/open");
+      assert.equal(options.method, "POST");
       opens += 1;
       state.snapshots.set("phone", newest);
       return before;
     },
+    applySavedWorkspaceOrder: (value: unknown) => value,
     queueRender() {},
   });
   assert.equal(opens, 1);

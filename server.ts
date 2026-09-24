@@ -16,20 +16,25 @@ import {
   type RpcQueueKind,
   type RpcQueueSnapshot,
 } from "./abort-session.ts";
-import { ImageAttachmentStore } from "./attachment-store.ts";
+import { AttachmentStore, detectImageMimeType } from "./attachment-store.ts";
+import { builtinCommandError, parseSlashCommand } from "./web/slash-commands.js";
+import { extensionSettings } from "./extension-settings.ts";
 import { isLocalRequest, WebAccess } from "./network-access.ts";
 import { FrpProcess } from "./frp-process.ts";
+import { loadTerminalProxy, saveTerminalProxy, validateTerminalProxy, type TerminalProxySettings } from "./terminal-proxy.ts";
 import { frpcConfig, loadNetworkSettings, proxyForNetwork, publicNetworkSettings, relayServerFiles, resolveFrpc, saveNetworkSettings, updateNetworkSettings, type NetworkMode, type NetworkSettings } from "./network-settings.ts";
-import { closeSseClient, createSseClient, sendSseEvent, type SseClient } from "./sse-channel.ts";
+import { closeSseClient, createSseClient, createSnapshotScheduler, sendSseEvent, type SseClient } from "./sse-channel.ts";
 import { closeAllPiRpcs, spawnPiRpc, type Json, type PiRpc } from "./pi-rpc.ts";
 import { loadLocalSession } from "./local-session.ts";
 import { loadJsonWithLegacyMigration, writeJsonAtomically, writeTextAtomically } from "./state-store.ts";
 import { buildFilePreview } from "./file-preview.ts";
+import { collectBackgroundJobs, readBackgroundJobLog } from "./background-jobs.ts";
 import { readClipboardImage, readClipboardText } from "./windows-clipboard.ts";
 import {
   applyAssistantDelta,
   applyToolExecution,
   attachToolResults,
+  browserMessages,
   findLast,
   renderAssistantMessage,
   renderCompaction,
@@ -49,6 +54,7 @@ const STATE_FILE = resolve(process.env.PI_WEB_STATE_FILE || join(STATE_DIR, "sta
 const LEGACY_STATE_FILE = resolve(process.env.PI_WEB_LEGACY_STATE_FILE || join(here, "state.json"));
 const AUTH_FILE = join(dirname(STATE_FILE), "auth.json");
 const NETWORK_FILE = join(dirname(STATE_FILE), "network.json");
+const TERMINAL_PROXY_FILE = join(dirname(STATE_FILE), "terminal-proxy.json");
 
 interface Workspace {
   id: string;
@@ -186,6 +192,7 @@ interface RuntimeSession {
   operationChain?: Promise<void>;
   pendingTreeNavigation?: PendingTreeNavigation;
   compactionNotice?: RenderedMessage;
+  compactionNoticeIndex?: number;
   pendingQueue?: RpcQueueSnapshot;
 }
 
@@ -212,6 +219,8 @@ let serverUrl: string | undefined;
 let serverInstanceId: string | undefined;
 let webAccess = new WebAccess(false);
 let networkSettings: NetworkSettings = { mode: "local" };
+let terminalProxy: TerminalProxySettings = { mode: "inherit", url: "http://127.0.0.1:7987" };
+let terminalProxySaving = false;
 let networkApplying = false;
 let networkChange: Promise<void> = Promise.resolve();
 let networkError: string | undefined;
@@ -219,6 +228,8 @@ let frpRuntimeDir: string | undefined;
 const frpProcess = new FrpProcess(() => broadcastEvent({ type: "network_changed" }));
 let updateExtensions: (() => Promise<MaintenanceCommandResult>) | undefined;
 let reloadRuntime: (() => Promise<void>) | undefined;
+let extensionSettingsCwd = process.cwd();
+let extensionSettingsSaving = false;
 let maintenanceRunning = false;
 let sessions = new Map<string, RuntimeSession>();
 let sseClients = new Set<SseClient>();
@@ -233,7 +244,7 @@ const modelInfoCache = new Map<string, ModelInfo>();
 const modelCatalogRefreshes = new Map<string, Promise<ModelCatalog>>();
 const commandCache = new Map<string, SlashCommandInfo[]>();
 const exportDownloads = new Map<string, ExportDownload>();
-const imageAttachments = new ImageAttachmentStore();
+const attachments = new AttachmentStore();
 const ABORT_RPC_TIMEOUT_MS = 3_000;
 const INTERNAL_TREE_COMMAND = "pi-web-navigate-tree";
 const INTERNAL_RELOAD_COMMAND = "pi-web-reload-runtime";
@@ -252,8 +263,10 @@ const MIME: Record<string, string> = {
   ".woff2": "font/woff2",
   ".ttf": "font/ttf",
   ".png": "image/png",
+  ".webp": "image/webp",
 };
 const MAX_FILE_VIEW_BYTES = 2 * 1024 * 1024;
+const MAX_IMAGE_VIEW_BYTES = 10 * 1024 * 1024;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -409,7 +422,7 @@ function historyEditorText(record: RuntimeSession, entryId: string): string | un
 async function pasteSystemClipboard(): Promise<Json> {
   const image = await readClipboardImage();
   if (image) {
-    const attachment = await imageAttachments.create(image.bytes);
+    const attachment = await attachments.create(image.bytes);
     return {
       kind: "image",
       attachment: { ...attachment, url: `/api/attachments/${attachment.id}` },
@@ -630,7 +643,9 @@ function snapshotMessages(record: RuntimeSession): RenderedMessage[] {
       return merged;
     }
   }
-  return [...record.messages, notice];
+  const messages = [...record.messages];
+  messages.splice(Math.min(record.compactionNoticeIndex ?? messages.length, messages.length), 0, notice);
+  return messages;
 }
 
 function pendingQueueSnapshot(record: RuntimeSession): RpcQueueSnapshot {
@@ -651,7 +666,14 @@ function setPendingQueue(record: RuntimeSession, queue: RpcQueueSnapshot): void 
   };
 }
 
+const snapshotScheduler = createSnapshotScheduler<RuntimeSession>(emitSessionSnapshot);
+
 function broadcastSessionSnapshot(record: RuntimeSession): void {
+  if (shuttingDown) return;
+  snapshotScheduler.schedule(record.id, record, !record.streaming || record.dialogs.length > 0);
+}
+
+function emitSessionSnapshot(record: RuntimeSession): void {
   broadcastEvent({
     type: "snapshot",
     sessionId: record.id,
@@ -663,7 +685,7 @@ function broadcastSessionSnapshot(record: RuntimeSession): void {
     thinkingLevelsByModel: thinkingLevelsByModel(record.models),
     commands: record.commands,
     extensionStatuses: record.extensionStatuses,
-    messages: snapshotMessages(record),
+    messages: browserMessages(snapshotMessages(record)),
     pendingQueue: pendingQueueSnapshot(record),
     dialogs: record.dialogs,
   });
@@ -876,7 +898,7 @@ async function discoverFreshModelCatalog(cwd: string): Promise<ModelCatalog> {
   const existing = modelCatalogRefreshes.get(key);
   if (existing) return existing;
   const task = (async () => {
-    const probe = spawnPiRpc({ cwd: key, noSession: true });
+    const probe = spawnPiRpc({ cwd: key, noSession: true, proxy: terminalProxy });
     try {
       const [modelsResponse, stateResponse] = await Promise.all([
         probe.send<Json>({ type: "get_available_models" }),
@@ -914,7 +936,7 @@ function applyModelInfo(record: RuntimeSession, info: ModelInfo): void {
 
 async function refreshModelsFresh(record: RuntimeSession): Promise<void> {
   if (record.starting) await record.starting;
-  if (record.streaming) {
+  if (record.streaming || hasRunningBackgroundJobs(record)) {
     await refreshModels(record);
     return;
   }
@@ -925,10 +947,15 @@ async function refreshModelsFresh(record: RuntimeSession): Promise<void> {
       const runtimeModels = (runtimeResponse.data?.models ?? []) as unknown[];
       if (!sameModelCatalog(runtimeModels, catalog.models)) {
         await Promise.allSettled([refreshState(record), refreshMessages(record)]);
+        if (record.streaming || hasRunningBackgroundJobs(record)) {
+          await refreshModels(record);
+          return;
+        }
         await stopSessionProcess(record);
       }
     } catch (error) {
       console.error("[pi-web] runtime model refresh failed:", error);
+      if (record.streaming || hasRunningBackgroundJobs(record)) return;
       await stopSessionProcess(record);
     }
   }
@@ -1232,6 +1259,7 @@ function bindSessionEvents(record: RuntimeSession, proc: PiRpc): void {
     } else if (event.type === "compaction_start") {
       const reason = typeof event.reason === "string" ? event.reason : undefined;
       record.state = { ...(record.state ?? {}), isCompacting: true };
+      record.compactionNoticeIndex = record.messages.length;
       record.compactionNotice = {
         kind: "compaction",
         id: `compaction-running:${Date.now()}`,
@@ -1263,6 +1291,7 @@ function bindSessionEvents(record: RuntimeSession, proc: PiRpc): void {
             timestamp: Date.now(),
           };
       record.compactionNotice = notice;
+      record.compactionNoticeIndex = record.messages.length;
       broadcastSessionSnapshot(record);
       if (result) {
         Promise.allSettled([refreshMessages(record), refreshStats(record)]).then(() => {
@@ -1308,10 +1337,15 @@ function bindSessionEvents(record: RuntimeSession, proc: PiRpc): void {
 // session lifecycle
 // ---------------------------------------------------------------------------
 
+function hasRunningBackgroundJobs(record: RuntimeSession): boolean {
+  // pi-pwsh-notify clears this live status only after its last background job exits.
+  return Boolean(record.extensionStatuses["pwsh-bg"]);
+}
+
 function evictIdleProcesses(): void {
   const idle: RuntimeSession[] = [];
   for (const record of sessions.values()) {
-    if (record.proc && !record.streaming && record.status !== "running" && record.status !== "starting" && record.dialogs.length === 0 && record.id !== state.currentSessionId) {
+    if (record.proc && !record.streaming && !hasRunningBackgroundJobs(record) && record.status !== "running" && record.status !== "starting" && record.dialogs.length === 0 && record.id !== state.currentSessionId) {
       idle.push(record);
     }
   }
@@ -1334,8 +1368,7 @@ async function applyPendingSettings(record: RuntimeSession): Promise<void> {
       await proc.send({ type: "set_model", provider: pending.provider, modelId: pending.modelId });
       record.pendingModel = undefined;
     } catch (error) {
-      console.error("[pi-web] applying pending model failed:", error);
-      record.pendingModel = undefined;
+      throw new Error(`无法使用模型 ${pending.provider}/${pending.modelId}，请在模型菜单中选择当前可用的模型：${error instanceof Error ? error.message : String(error)}`);
     }
   }
   if (record.pendingThinkingLevel) {
@@ -1373,6 +1406,7 @@ async function ensureProcess(record: RuntimeSession): Promise<void> {
   const task = (async () => {
     const proc = spawnPiRpc({
       cwd: record.cwd,
+      proxy: terminalProxy,
       sessionId: record.sessionFile ? undefined : record.id,
       sessionFile: record.sessionFile,
       name: record.title === "新会话" ? undefined : record.title,
@@ -1392,9 +1426,16 @@ async function ensureProcess(record: RuntimeSession): Promise<void> {
       broadcastWorkspaces();
       evictIdleProcesses();
     } catch (error) {
+      if (record.proc === proc) record.proc = undefined;
+      try {
+        await proc.close(2500);
+      } catch (closeError) {
+        console.error("[pi-web] closing failed session process:", closeError);
+      }
       record.status = "error";
       record.error = error instanceof Error ? error.message : String(error);
       broadcastSessionSnapshot(record);
+      throw error;
     } finally {
       record.starting = undefined;
     }
@@ -1535,6 +1576,7 @@ async function deleteWorkspaceSession(workspace: Workspace, sessionId: string): 
     candidate.updatedAt = updatedAt;
   }
   state.sessions = state.sessions.filter((session) => session.id !== sessionId);
+  snapshotScheduler.cancel(sessionId);
   sessions.delete(sessionId);
   if (state.currentSessionId === sessionId) state.currentSessionId = undefined;
   scheduleSave();
@@ -1548,14 +1590,23 @@ async function createSession(
 ): Promise<RuntimeSession> {
   const ws = state.workspaces.find((w) => w.id === workspaceId);
   if (!ws) throw new Error("workspace not found");
+  const info = modelInfoFromCatalog(
+    await discoverFreshModelCatalog(ws.path),
+    preferences.model,
+    preferences.thinkingLevel,
+  );
+  const selected = info.defaultModel as Json | undefined;
+  const model = selected && typeof selected.provider === "string" && typeof selected.id === "string"
+    ? { provider: selected.provider, modelId: selected.id }
+    : undefined;
   const id = randomUUID();
   const cleanTitle = (title ?? "").trim().replace(/\s+/g, " ").slice(0, 60) || "新会话";
   const stored: StoredSession = {
     id,
     workspaceId,
     title: cleanTitle,
-    model: preferences.model,
-    thinkingLevel: preferences.thinkingLevel,
+    model,
+    thinkingLevel: info.thinkingLevel,
     needsAttention: false,
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -1580,29 +1631,11 @@ async function createSession(
     streaming: false,
     needsAttention: false,
     lastUsed: Date.now(),
-    pendingModel: preferences.model,
-    pendingThinkingLevel: preferences.thinkingLevel,
+    pendingModel: model,
+    pendingThinkingLevel: info.thinkingLevel,
   };
-  applyCachedModelInfo(record);
+  applyModelInfo(record, info);
   applyCachedCommands(record);
-  if (preferences.model) {
-    const full = (record.models as Json[]).find(
-      (model) => model?.provider === preferences.model?.provider && model.id === preferences.model?.modelId,
-    );
-    record.state = {
-      ...(record.state ?? {}),
-      model: full ?? { provider: preferences.model.provider, id: preferences.model.modelId, name: preferences.model.modelId },
-    };
-    if (full) record.thinkingLevels = supportedThinkingLevels(full);
-  }
-  if (preferences.thinkingLevel) {
-    const effectiveLevel = record.thinkingLevels.includes(preferences.thinkingLevel)
-      ? preferences.thinkingLevel
-      : record.thinkingLevels.includes("off") ? "off" : record.thinkingLevels[0] ?? "off";
-    record.pendingThinkingLevel = effectiveLevel;
-    stored.thinkingLevel = effectiveLevel;
-    record.state = { ...(record.state ?? {}), thinkingLevel: effectiveLevel };
-  }
   sessions.set(id, record);
   scheduleSave();
   broadcastWorkspaces();
@@ -2112,6 +2145,46 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
     return sendJson(res, 200, { ok: true });
   }
 
+  if (path === "/api/extensions" && (method === "GET" || method === "POST")) {
+    if (!isLocalRequest(req)) return sendJson(res, 403, { error: "请在电脑本机网页管理扩展" });
+    if (extensionSettingsSaving || maintenanceRunning) return sendJson(res, 409, { error: "扩展配置或维护操作正在执行，请稍后重试" });
+    extensionSettingsSaving = true;
+    try {
+      let change: { scope: "global" | "project"; source: string; enabled: boolean } | undefined;
+      if (method === "POST") {
+        const body = await readJsonBody(req, 16 * 1024);
+        if ((body.scope !== "global" && body.scope !== "project") || typeof body.source !== "string" || !body.source || typeof body.enabled !== "boolean") {
+          return sendJson(res, 400, { error: "扩展配置参数无效" });
+        }
+        change = { scope: body.scope, source: body.source, enabled: body.enabled };
+      }
+      return sendJson(res, 200, await extensionSettings(extensionSettingsCwd, change));
+    } catch (error) {
+      return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      extensionSettingsSaving = false;
+    }
+  }
+
+  if (path === "/api/terminal-proxy") {
+    if (!isLocalRequest(req)) return sendJson(res, 403, { error: "请在电脑本机网页配置终端代理" });
+    if (method === "GET") return sendJson(res, 200, { settings: terminalProxy });
+    if (method === "POST") {
+      if (terminalProxySaving) return sendJson(res, 409, { error: "终端代理正在保存，请稍后重试" });
+      terminalProxySaving = true;
+      try {
+        const next = validateTerminalProxy(await readJsonBody(req, 4096));
+        await saveTerminalProxy(TERMINAL_PROXY_FILE, next);
+        terminalProxy = next;
+        return sendJson(res, 200, { settings: terminalProxy });
+      } catch (error) {
+        return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      } finally {
+        terminalProxySaving = false;
+      }
+    }
+  }
+
   if (path === "/api/network" || path === "/api/network/server-files") {
     if (!isLocalRequest(req)) return sendJson(res, 403, { error: "请在电脑本机网页配置网络访问" });
     if (method === "GET" && path === "/api/network/server-files") {
@@ -2162,7 +2235,7 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
   }
 
   if (method === "POST" && (path === "/api/maintenance/update-and-reload" || path === "/api/maintenance/reload")) {
-    if (maintenanceRunning) return sendJson(res, 409, { error: "维护操作正在执行" });
+    if (maintenanceRunning || extensionSettingsSaving) return sendJson(res, 409, { error: "维护操作或扩展配置正在执行" });
     if (!reloadRuntime || (path.endsWith("update-and-reload") && !updateExtensions)) {
       return sendJson(res, 503, { error: "当前 Pi 运行时不支持 Web 维护操作，请先执行一次 /reload" });
     }
@@ -2202,10 +2275,10 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
   if (method === "POST" && path === "/api/attachments") {
     const body = await readJsonBody(req, 21 * 1024 * 1024);
     if (typeof body.data !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.data)) {
-      return sendJson(res, 400, { error: "图片数据无效" });
+      return sendJson(res, 400, { error: "文件数据无效" });
     }
     try {
-      const attachment = await imageAttachments.create(Buffer.from(body.data, "base64"));
+      const attachment = await attachments.create(Buffer.from(body.data, "base64"), typeof body.name === "string" ? body.name : undefined);
       return sendJson(res, 200, { attachment: { ...attachment, url: `/api/attachments/${attachment.id}` } });
     } catch (error) {
       return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
@@ -2215,9 +2288,10 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
   const attachmentMatch = /^\/api\/attachments\/([a-f0-9-]+)$/.exec(path);
   if (attachmentMatch && (method === "GET" || method === "HEAD")) {
     try {
-      const { meta, bytes } = await imageAttachments.read(attachmentMatch[1]);
+      const { meta, bytes } = await attachments.read(attachmentMatch[1]);
       res.writeHead(200, {
         "content-type": meta.mimeType,
+        ...(meta.kind === "document" ? { "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(meta.name)}` } : {}),
         "content-length": bytes.byteLength,
         "cache-control": "private, no-store",
         "x-content-type-options": "nosniff",
@@ -2230,7 +2304,7 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
   }
 
   if (attachmentMatch && method === "DELETE") {
-    const removed = await imageAttachments.remove(attachmentMatch[1]);
+    const removed = await attachments.remove(attachmentMatch[1]);
     return sendJson(res, removed ? 200 : 404, removed ? { ok: true } : { error: "attachment not found" });
   }
 
@@ -2266,8 +2340,20 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
       const target = normalizePath(input);
       const info = await stat(target);
       if (!info.isFile()) return sendJson(res, 400, { error: "path is not a file" });
-      if (info.size > MAX_FILE_VIEW_BYTES) return sendJson(res, 413, { error: "file is too large to preview" });
+      const image = url.searchParams.get("format") === "image";
+      if (info.size > (image ? MAX_IMAGE_VIEW_BYTES : MAX_FILE_VIEW_BYTES)) return sendJson(res, 413, { error: "file is too large to preview" });
       const data = await readFile(target);
+      if (image) {
+        const mimeType = await detectImageMimeType(target, data);
+        if (!mimeType) return sendJson(res, 415, { error: "file is not a supported image" });
+        res.writeHead(200, {
+          "content-type": mimeType,
+          "cache-control": "private, no-store",
+          "x-content-type-options": "nosniff",
+        });
+        res.end(data);
+        return true;
+      }
       if (data.includes(0)) return sendJson(res, 415, { error: "binary files cannot be previewed" });
       if (url.searchParams.get("format") === "json") {
         return sendJson(res, 200, buildFilePreview(target, data));
@@ -2440,14 +2526,19 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
       && typeof requestedModel.modelId === "string"
       ? { provider: requestedModel.provider, modelId: requestedModel.modelId }
       : undefined;
-    const record = await createSession(
-      ws.id,
-      typeof body.title === "string" ? body.title : undefined,
-      {
-        model,
-        thinkingLevel: typeof body.thinkingLevel === "string" ? body.thinkingLevel : undefined,
-      },
-    );
+    let record: RuntimeSession;
+    try {
+      record = await createSession(
+        ws.id,
+        typeof body.title === "string" ? body.title : undefined,
+        {
+          model,
+          thinkingLevel: typeof body.thinkingLevel === "string" ? body.thinkingLevel : undefined,
+        },
+      );
+    } catch (error) {
+      return sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
     state.currentWorkspaceId = ws.id;
     state.currentSessionId = record.id;
     scheduleSave();
@@ -2455,7 +2546,7 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
     return sendJson(res, 200, {
       session: sessionSummary(record),
       state: record.state,
-      messages: record.messages,
+      messages: browserMessages(record.messages),
       pendingQueue: pendingQueueSnapshot(record),
       models: record.models,
       thinkingLevels: record.thinkingLevels,
@@ -2480,6 +2571,21 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
     const match = /^\/api\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(path);
     const action = match?.[2] ?? "";
 
+    if (method === "GET" && action === "background-jobs") {
+      const jobs = collectBackgroundJobs(session.messages);
+      const requested = url.searchParams.get("job");
+      const job = requested ? jobs.find((item) => item.id === requested) : jobs[0];
+      if (requested && !job) return sendJson(res, 404, { error: "当前会话中找不到此后台任务" });
+      const visible = ({ logPath: _logPath, ...item }: typeof jobs[number]) => item;
+      const data = { jobs: jobs.map(visible), job: job ? visible(job) : null };
+      if (!job) return sendJson(res, 200, { ...data, output: "", truncated: false });
+      try {
+        return sendJson(res, 200, { ...data, ...await readBackgroundJobLog(job.logPath) });
+      } catch (error) {
+        return sendJson(res, 200, { ...data, output: "", truncated: false, error: (error as NodeJS.ErrnoException).code === "ENOENT" ? "日志文件已被清理或尚未创建" : "无法读取任务日志" });
+      }
+    }
+
     if (method === "POST" && action === "models") {
       try {
         await refreshModelsFresh(session);
@@ -2500,7 +2606,7 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
       return sendJson(res, 200, {
         session: sessionSummary(session),
         state: session.state,
-        messages: snapshotMessages(session),
+        messages: browserMessages(snapshotMessages(session)),
         pendingQueue: pendingQueueSnapshot(session),
         models: session.models,
         thinkingLevels: session.thinkingLevels,
@@ -2580,10 +2686,44 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
             history: nextHistory,
             session: sessionSummary(session),
             state: session.state,
-            messages: snapshotMessages(session),
+            messages: browserMessages(snapshotMessages(session)),
             pendingQueue: pendingQueueSnapshot(session),
             stats: session.stats,
           });
+        });
+      } catch (error) {
+        return sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    if (method === "POST" && action === "reload") {
+      try {
+        return await withSessionOperation(session, async () => {
+          await ensureProcess(session);
+          if (session.streaming || session.state?.isCompacting || session.dialogs.length > 0) {
+            return sendJson(res, 409, { error: "请等待当前会话运行结束并处理完交互后再重载" });
+          }
+          const proc = session.proc!;
+          const commandsResponse = await proc.send<Json>({ type: "get_commands" });
+          const commands = commandsResponse.data?.commands;
+          if (!Array.isArray(commands) || !commands.some((command) => command?.name === INTERNAL_RELOAD_COMMAND)) {
+            return sendJson(res, 409, { error: "当前会话未加载 Web 重载命令，请重启 Pi Web 后重试" });
+          }
+          let commandError: string | undefined;
+          const unsubscribe = proc.onEvent((event) => {
+            if (event.type === "extension_error" && event.extensionPath === `command:${INTERNAL_RELOAD_COMMAND}`) {
+              commandError = String(event.error || "会话重载失败");
+            }
+          });
+          try {
+            await proc.send({ type: "prompt", message: `/${INTERNAL_RELOAD_COMMAND}` });
+            if (commandError) throw new Error(commandError);
+          } finally {
+            unsubscribe();
+          }
+          await Promise.all([refreshState(session), refreshCommands(session), refreshModels(session)]);
+          broadcastSessionSnapshot(session);
+          return sendJson(res, 200, { ok: true, reloaded: true });
         });
       } catch (error) {
         return sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
@@ -2597,35 +2737,47 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
         ? body.attachmentIds.filter((id): id is string => typeof id === "string")
         : [];
       if (!message.trim() && attachmentIds.length === 0) {
-        return sendJson(res, 400, { error: "message or image attachment is required" });
+        return sendJson(res, 400, { error: "请输入消息或添加文件附件" });
       }
+      const parsedCommand = parseSlashCommand(message);
+      const builtinError = parsedCommand ? builtinCommandError(parsedCommand.name) : null;
+      if (builtinError) return sendJson(res, 400, { error: builtinError });
       try {
         return await withSessionOperation(session, async () => {
           await ensureProcess(session);
           const wasStreaming = session.streaming;
           if (attachmentIds.length > 0 && wasStreaming) {
-            return sendJson(res, 409, { error: "生成过程中暂不支持排队图片，请停止当前生成后再发送" });
+            return sendJson(res, 409, { error: "生成过程中暂不支持排队附件，请停止当前生成后再发送" });
           }
           if (attachmentIds.length > 0 && message.trimStart().startsWith("/")) {
-            return sendJson(res, 400, { error: "斜杠命令不能附带图片" });
+            return sendJson(res, 400, { error: "斜杠命令不能附带附件" });
           }
           const model = session.state?.model;
           const modelInput = model && typeof model === "object" && Array.isArray((model as Json).input)
             ? (model as Json).input as unknown[]
             : [];
-          if (attachmentIds.length > 0 && !modelInput.includes("image")) {
-            return sendJson(res, 400, { error: "当前模型不支持图片输入，请切换视觉模型" });
-          }
-          let images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+          let prepared: Awaited<ReturnType<AttachmentStore["promptForRpc"]>>;
           try {
-            images = await imageAttachments.imagesForRpc(attachmentIds);
+            prepared = await attachments.promptForRpc(attachmentIds, message);
           } catch (error) {
             return sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
           }
-          const promptMessage = message.trim() || "请分析附加图片。";
-          if (promptMessage.trimStart().startsWith("/")) await refreshCommands(session);
-          const optimisticStreaming = !wasStreaming && !isImmediateExtensionCommand(session, promptMessage);
-          const command: Json = { type: "prompt", message: promptMessage };
+          const { images, message: promptMessage } = prepared;
+          if (images.length > 0 && !modelInput.includes("image")) {
+            return sendJson(res, 400, { error: "当前模型不支持图片输入，请切换视觉模型" });
+          }
+          const slash = /^\/([^\s]+)(?:\s|$)/.exec(promptMessage.trim());
+          if (promptMessage.trimStart().startsWith("/")) {
+            const response = await session.proc!.send<Json>({ type: "get_commands" });
+            session.commands = normalizeCommands(response.data?.commands);
+            commandCache.set(session.cwd, session.commands);
+            if (!slash || !session.commands.some((command) => command.name === slash[1])) {
+              return sendJson(res, 400, { error: `未知或不可用的命令：${slash ? `/${slash[1]}` : "/"}。请输入 / 查看可用命令；普通消息请勿以 / 开头。` });
+            }
+          }
+          const immediateCommand = isImmediateExtensionCommand(session, promptMessage);
+          const optimisticStreaming = !wasStreaming && !immediateCommand;
+          const command: Json = { type: "prompt", message: slash ? promptMessage.trim() : promptMessage };
           if (images.length > 0) command.images = images;
           if (wasStreaming) command.streamingBehavior = "steer";
           if (optimisticStreaming) {
@@ -2635,15 +2787,15 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
           }
           try {
             const response = await session.proc!.send(command);
-            await Promise.all(attachmentIds.map((id) => imageAttachments.remove(id)));
-            if (!session.title || session.title === "新会话") {
-              const nextTitle = message.trim().replace(/\s+/g, " ").slice(0, 60) || "图片会话";
+            await Promise.all(attachmentIds.map((id) => attachments.remove(id)));
+            if (!immediateCommand && (!session.title || session.title === "新会话")) {
+              const nextTitle = message.trim().replace(/\s+/g, " ").slice(0, 60) || "文件会话";
               session.title = nextTitle;
               updateStoredSession(session);
               session.proc?.send({ type: "set_session_name", name: nextTitle }).catch(() => {});
               broadcastWorkspaces();
             }
-            return sendJson(res, 200, { ok: true, response, queued: wasStreaming });
+            return sendJson(res, 200, { ok: true, response, queued: wasStreaming && !immediateCommand });
           } catch (error) {
             if (optimisticStreaming) {
               session.streaming = false;
@@ -2884,24 +3036,37 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
       const body = await readJsonBody(req);
       const name = typeof body.name === "string" ? body.name.trim().replace(/\s+/g, " ").slice(0, 60) : "";
       if (!name) return sendJson(res, 400, { error: "name is required" });
-      session.title = name;
-      updateStoredSession(session);
-      if (session.proc) {
-        session.proc.send({ type: "set_session_name", name }).catch(() => {});
-      } else {
-        session.pendingName = name;
-        scheduleSave();
+      try {
+        if (session.proc) {
+          await session.proc.send({ type: "set_session_name", name });
+          session.pendingName = undefined;
+        } else {
+          session.pendingName = name;
+        }
+        session.title = name;
+        updateStoredSession(session);
+        broadcastWorkspaces();
+        broadcastSessionSnapshot(session);
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
       }
-      broadcastWorkspaces();
-      broadcastSessionSnapshot(session);
-      return sendJson(res, 200, { ok: true });
     }
 
     if (method === "POST" && action === "compact") {
-      await ensureProcess(session);
+      const body = await readJsonBody(req);
+      const customInstructions = typeof body.customInstructions === "string" ? body.customInstructions.trim() : "";
       try {
-        const response = await session.proc!.send({ type: "compact" });
-        return sendJson(res, 200, { ok: true, response });
+        return await withSessionOperation(session, async () => {
+          await ensureProcess(session);
+          if (session.streaming || session.state?.isCompacting || session.dialogs.length > 0) {
+            return sendJson(res, 409, { error: "请等待当前会话运行结束并处理完交互后再压缩" });
+          }
+          const response = await session.proc!.send({ type: "compact", ...(customInstructions ? { customInstructions } : {}) });
+          await Promise.all([refreshState(session), refreshMessages(session), refreshStats(session)]);
+          broadcastSessionSnapshot(session);
+          return sendJson(res, 200, { ok: true, response });
+        });
       } catch (error) {
         return sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
       }
@@ -2970,7 +3135,7 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
       return sendJson(res, 200, {
         session: sessionSummary(session),
         state: session.state,
-        messages: snapshotMessages(session),
+        messages: browserMessages(snapshotMessages(session)),
         pendingQueue: pendingQueueSnapshot(session),
         models: session.models,
         thinkingLevels: session.thinkingLevels,
@@ -3091,7 +3256,7 @@ function exitHook(): void {
       // ignore
     }
   }
-  void imageAttachments.close();
+  void attachments.close();
 }
 
 function sigintHook(): void {
@@ -3106,6 +3271,7 @@ function shutdown(): Promise<void> {
 }
 
 async function shutdownServer(): Promise<void> {
+  snapshotScheduler.clear();
   await networkChange;
   await stopRelay();
   for (const client of [...sseClients]) {
@@ -3121,7 +3287,7 @@ async function shutdownServer(): Promise<void> {
   await closeAllPiRpcs();
   for (const download of exportDownloads.values()) unlink(download.path).catch(() => {});
   exportDownloads.clear();
-  await imageAttachments.close();
+  await attachments.close();
   if (heartbeat) clearInterval(heartbeat);
   heartbeat = undefined;
   await saveStateNow().catch(() => {});
@@ -3155,6 +3321,7 @@ export async function startWebServer(options: {
 } = {}): Promise<string> {
   if (shutdownPromise) await shutdownPromise;
   const initialCwd = normalizePath(options.defaultCwd ?? process.cwd());
+  extensionSettingsCwd = initialCwd;
   updateExtensions = options.updateExtensions;
   reloadRuntime = options.reloadRuntime;
   const mode = options.mode ?? (options.lan === undefined ? undefined : options.lan ? "lan" : "local");
@@ -3188,6 +3355,7 @@ export async function startWebServer(options: {
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
     throw new Error("端口必须是 0–65535 之间的整数");
   }
+  terminalProxy = await loadTerminalProxy(TERMINAL_PROXY_FILE);
   networkSettings = await loadNetworkSettings(NETWORK_FILE);
   if (mode !== undefined) {
     networkSettings = updateNetworkSettings({ mode }, networkSettings);

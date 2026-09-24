@@ -64,8 +64,9 @@ test("the extension directly authenticates relayed requests and keeps network co
   assert.equal(boot.localClient, false);
   assert.deepEqual(boot.lanUrls, []);
   assert.equal(boot.workspaces[0].sessions.length, 2);
-  for (const path of ["/api/network", "/api/network/server-files"]) assert.equal((await get(path, { cookie })).status, 403);
+  for (const path of ["/api/network", "/api/network/server-files", "/api/terminal-proxy"]) assert.equal((await get(path, { cookie })).status, 403);
   assert.equal((await post("/api/network", { mode: "lan" }, cookie)).status, 403);
+  assert.equal((await post("/api/terminal-proxy", { mode: "direct", url: "" }, cookie)).status, 403);
   assert.equal((await post("/api/auth/password", { password: "changed" }, cookie)).status, 403);
   assert.equal((await get("/api/bootstrap", { cookie, origin: "https://attacker.example" })).status, 403);
   const abort = new AbortController();
@@ -80,9 +81,16 @@ test("the extension directly authenticates relayed requests and keeps network co
   assert.ok(files.files["visitor.toml"].includes(settings.relay!.secretKey));
   assert.equal((await localPost("/api/network", { mode: "relay", relay: { ...settings.relay, frpcPath: "./also-missing.exe" } })).status, 400);
   assert.equal(JSON.parse(await readFile(join(dir, "network.json"), "utf8")).relay.frpcPath, "./uninstalled-frpc.exe");
+  assert.equal((await (await fetch(`${url}/api/terminal-proxy`)).json()).settings.mode, "inherit");
+  const proxy = { mode: "manual", url: "http://127.0.0.1:10808" };
+  assert.equal((await localPost("/api/terminal-proxy", proxy)).status, 200);
+  assert.deepEqual(JSON.parse(await readFile(join(dir, "terminal-proxy.json"), "utf8")), proxy);
+  assert.equal((await localPost("/api/terminal-proxy", { ...proxy, url: "socks5://127.0.0.1:10808" })).status, 400);
+  assert.deepEqual((await (await fetch(`${url}/api/terminal-proxy`)).json()).settings, proxy);
   const connection = getWebConnectionOptions()!;
   await stopWebServer();
   await startWebServer({ ...connection, open: false });
+  assert.deepEqual((await (await fetch(`${url}/api/terminal-proxy`)).json()).settings, proxy);
   assert.equal((await get("/api/bootstrap", { cookie })).status, 200);
   assert.equal((await localPost("/api/auth/password", { password: "new-password" })).status, 200);
   assert.equal((await get("/api/bootstrap", { cookie })).status, 401);

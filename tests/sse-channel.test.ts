@@ -1,7 +1,40 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
-import { closeSseClient, createSseClient, sendSseEvent } from "../sse-channel.ts";
+import { closeSseClient, createSseClient, createSnapshotScheduler, sendSseEvent } from "../sse-channel.ts";
+
+test("snapshot bursts coalesce per session and final state flushes immediately", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const sent: number[] = [];
+  const scheduler = createSnapshotScheduler<number>((value) => sent.push(value));
+  scheduler.schedule("a", 1);
+  scheduler.schedule("a", 2);
+  scheduler.schedule("a", 3);
+  scheduler.schedule("b", 4);
+  assert.deepEqual(sent, [1, 4]);
+  t.mock.timers.tick(100);
+  assert.deepEqual(sent, [1, 4, 3]);
+  scheduler.schedule("a", 5);
+  scheduler.schedule("a", 6);
+  scheduler.schedule("a", 7, true);
+  assert.deepEqual(sent, [1, 4, 3, 5, 7]);
+  t.mock.timers.tick(100);
+  assert.deepEqual(sent, [1, 4, 3, 5, 7]);
+});
+
+test("snapshot cancellation and shutdown discard delayed snapshots", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const sent: number[] = [];
+  const scheduler = createSnapshotScheduler<number>((value) => sent.push(value));
+  scheduler.schedule("a", 1);
+  scheduler.schedule("a", 2);
+  scheduler.cancel("a");
+  scheduler.schedule("b", 3);
+  scheduler.schedule("b", 4);
+  scheduler.clear();
+  t.mock.timers.tick(100);
+  assert.deepEqual(sent, [1, 3]);
+});
 
 class FakeResponse extends EventEmitter {
   readonly writes: string[] = [];

@@ -3,6 +3,10 @@
 This package contains adapted web UI styles and bundled font assets from the
 projects below. Their licenses are reproduced here as required.
 
+The browser Markdown renderer also bundles markdown-it and highlight.js with
+their dependencies. Their license texts are included in
+`web/assets/markdown.LICENSE.txt`, next to the bundled renderer.
+
 ## DeepSeek Harness
 
 Source: https://github.com/deepseek-ai/deepseek-harness

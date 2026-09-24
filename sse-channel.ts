@@ -1,5 +1,42 @@
 export type SseEvent = Record<string, unknown>;
 
+// Coalesce before serializing full histories, so a burst of tokens does not
+// become a queue of obsolete snapshots on a slower relay connection.
+export function createSnapshotScheduler<T>(emit: (value: T) => void, intervalMs = 100) {
+  const pending = new Map<string, { timer: ReturnType<typeof setTimeout>; latest?: T }>();
+  function cancel(key: string): void {
+    const entry = pending.get(key);
+    if (entry) clearTimeout(entry.timer);
+    pending.delete(key);
+  }
+  return {
+    schedule(key: string, value: T, immediate = false): void {
+      if (immediate) {
+        cancel(key);
+        emit(value);
+        return;
+      }
+      const current = pending.get(key);
+      if (current) {
+        current.latest = value;
+        return;
+      }
+      const entry: { timer: ReturnType<typeof setTimeout>; latest?: T } = {
+        timer: setTimeout(() => {
+          pending.delete(key);
+          if (entry.latest !== undefined) emit(entry.latest);
+        }, intervalMs),
+      };
+      pending.set(key, entry);
+      emit(value);
+    },
+    cancel,
+    clear(): void {
+      for (const key of pending.keys()) cancel(key);
+    },
+  };
+}
+
 export interface SseWritable {
   write(payload: string): boolean;
   once(event: "drain", listener: () => void): unknown;

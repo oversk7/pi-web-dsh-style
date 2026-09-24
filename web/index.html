@@ -8,11 +8,15 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <title>Pi Web</title>
     <link rel="stylesheet" href="/app.css" />
+    <link rel="stylesheet" href="/themes.css" />
   </head>
   <body>
     <script>
       (() => {
-        const preference = localStorage.getItem("pi-web-theme") || "system";
+        const saved = localStorage.getItem("pi-web-theme");
+        const preference = ["light", "dark", "system"].includes(saved) ? saved : "system";
+        const style = localStorage.getItem("pi-web-theme-style");
+        document.body.dataset.themeStyle = ["classic", "sakura", "starlight"].includes(style) ? style : "classic";
         const systemDark = preference === "system" && matchMedia("(prefers-color-scheme: dark)").matches;
         const dark = preference === "dark" || systemDark;
         document.documentElement.style.colorScheme = dark ? "dark" : "light";

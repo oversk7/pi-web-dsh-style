@@ -2,4 +2,12 @@ node_modules/
 *.tgz
 *.tmp
 state.json
+auth.json
+network.json
+terminal-proxy.json
+runtime/
+.env
+.env.*
+.npmrc
+*.log
 .pi-web-test/

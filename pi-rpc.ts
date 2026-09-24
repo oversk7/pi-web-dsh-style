@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
+import { terminalProxyEnv, type TerminalProxySettings } from "./terminal-proxy.ts";
 
 export type Json = Record<string, any>;
 
@@ -72,6 +73,7 @@ export interface PiRpcSpawnOptions {
   sessionFile?: string;
   name?: string;
   noSession?: boolean;
+  proxy?: TerminalProxySettings;
 }
 
 export function spawnPiRpc(options: PiRpcSpawnOptions): PiRpc {
@@ -95,7 +97,7 @@ export function spawnPiRpc(options: PiRpcSpawnOptions): PiRpc {
   const child = spawn(executable, childArgs, {
     cwd: options.cwd,
     env: {
-      ...process.env, NO_COLOR: "1", PI_TELEMETRY: "0",
+      ...(options.proxy ? terminalProxyEnv(options.proxy) : process.env), NO_COLOR: "1", PI_TELEMETRY: "0",
       ...(windows ? { PI_WEB_RPC_JOB: JSON.stringify({ ownerPid: process.pid, executable: process.execPath, args: [launch.entry, ...args], cwd: options.cwd }) } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -160,8 +162,8 @@ export function spawnPiRpc(options: PiRpcSpawnOptions): PiRpc {
     console.error(`[pi-web rpc stderr] ${text}`);
   };
 
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderrBuffer += chunk.toString("utf8");
+  child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+    stderrBuffer += chunk;
     let idx: number;
     while ((idx = stderrBuffer.indexOf("\n")) >= 0) {
       logStderrLine(stderrBuffer.slice(0, idx));
@@ -173,8 +175,8 @@ export function spawnPiRpc(options: PiRpcSpawnOptions): PiRpc {
     stderrBuffer = "";
   });
 
-  child.stdout?.on("data", (chunk: Buffer) => {
-    buffer += chunk.toString("utf8");
+  child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+    buffer += chunk;
     let idx: number;
     while ((idx = buffer.indexOf("\n")) >= 0) {
       let line = buffer.slice(0, idx);

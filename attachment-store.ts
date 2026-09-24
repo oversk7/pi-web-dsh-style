@@ -2,17 +2,22 @@ import { randomUUID } from "node:crypto";
 import { readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseDocument } from "./attachment-parser.ts";
 
-export interface ImageAttachmentMeta {
+export interface AttachmentMeta {
   id: string;
+  kind: "image" | "document";
+  name: string;
+  textLength?: number;
   mimeType: string;
   size: number;
   createdAt: number;
   expiresAt: number;
 }
 
-interface StoredImageAttachment extends ImageAttachmentMeta {
+interface StoredAttachment extends AttachmentMeta {
   path: string;
+  text?: string;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -43,53 +48,62 @@ function fallbackImageMimeType(bytes: Uint8Array): string | null {
   return null;
 }
 
-async function detectImageMimeType(path: string, bytes: Uint8Array): Promise<string | null> {
+export async function detectImageMimeType(path: string, bytes: Uint8Array): Promise<string | null> {
   const detector = await resolvePublicMimeDetector();
   return detector ? detector(path) : fallbackImageMimeType(bytes);
 }
 
-export interface ImageAttachmentStoreOptions {
+export interface AttachmentStoreOptions {
   directory?: string;
   ttlMs?: number;
   maxBytes?: number;
   maxPromptImages?: number;
+  maxPromptAttachments?: number;
 }
 
-export class ImageAttachmentStore {
+export class AttachmentStore {
   readonly maxPromptImages: number;
+  readonly maxPromptAttachments: number;
   private readonly directory: string;
   private readonly ttlMs: number;
   private readonly maxBytes: number;
-  private readonly entries = new Map<string, StoredImageAttachment>();
+  private readonly entries = new Map<string, StoredAttachment>();
 
-  constructor(options: ImageAttachmentStoreOptions = {}) {
+  constructor(options: AttachmentStoreOptions = {}) {
     this.directory = options.directory ?? tmpdir();
     this.ttlMs = options.ttlMs ?? 24 * 60 * 60 * 1000;
     this.maxBytes = options.maxBytes ?? 15 * 1024 * 1024;
     this.maxPromptImages = options.maxPromptImages ?? 4;
+    this.maxPromptAttachments = options.maxPromptAttachments ?? 8;
   }
 
-  async create(bytes: Uint8Array): Promise<ImageAttachmentMeta> {
-    if (bytes.byteLength === 0) throw new Error("图片内容为空");
+  async create(bytes: Uint8Array, filename?: string): Promise<AttachmentMeta> {
+    if (bytes.byteLength === 0) throw new Error("文件内容为空");
     if (bytes.byteLength > this.maxBytes) {
-      throw new Error(`图片不能超过 ${Math.floor(this.maxBytes / 1024 / 1024)} MB`);
+      throw new Error(`文件不能超过 ${Math.floor(this.maxBytes / 1024 / 1024)} MB`);
     }
 
     const id = randomUUID();
-    const path = join(this.directory, `pi-web-attachment-${id}.img`);
+    const path = join(this.directory, `pi-web-attachment-${id}.upload`);
+    const name = filename?.split(/[\\/]/).pop()?.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 255) || "";
     await writeFile(path, bytes);
     try {
-      const mimeType = await detectImageMimeType(path, bytes);
-      if (!mimeType) throw new Error("不支持的图片格式");
+      const imageMimeType = await detectImageMimeType(path, bytes);
+      if (!imageMimeType && !name) throw new Error("不支持的图片格式");
+      const document = imageMimeType ? undefined : await parseDocument(bytes, name);
+      const mimeType = imageMimeType || document!.mimeType;
       const createdAt = Date.now();
       const expiresAt = createdAt + this.ttlMs;
       const timer = setTimeout(() => {
         void this.remove(id);
       }, this.ttlMs);
       timer.unref();
-      const stored: StoredImageAttachment = {
+      const stored: StoredAttachment = {
         id,
         path,
+        kind: imageMimeType ? "image" : "document",
+        name: name || `图片.${mimeType.split("/")[1]}`,
+        ...(document ? { text: document.text, textLength: document.text.length } : {}),
         mimeType,
         size: bytes.byteLength,
         createdAt,
@@ -104,7 +118,7 @@ export class ImageAttachmentStore {
     }
   }
 
-  get(id: string): ImageAttachmentMeta | undefined {
+  get(id: string): AttachmentMeta | undefined {
     const stored = this.entries.get(id);
     if (!stored) return undefined;
     if (stored.expiresAt <= Date.now()) {
@@ -114,26 +128,52 @@ export class ImageAttachmentStore {
     return this.meta(stored);
   }
 
-  async read(id: string): Promise<{ meta: ImageAttachmentMeta; bytes: Buffer }> {
+  async read(id: string): Promise<{ meta: AttachmentMeta; bytes: Buffer }> {
     const stored = this.entries.get(id);
     if (!stored || stored.expiresAt <= Date.now()) {
       if (stored) await this.remove(id);
-      throw new Error("图片附件不存在或已过期");
+      throw new Error("附件不存在或已过期");
     }
     return { meta: this.meta(stored), bytes: await readFile(stored.path) };
   }
 
-  async imagesForRpc(ids: string[]): Promise<Array<{ type: "image"; data: string; mimeType: string }>> {
+  async promptForRpc(ids: string[], message: string): Promise<{
+    message: string;
+    images: Array<{ type: "image"; data: string; mimeType: string }>;
+  }> {
     const uniqueIds = [...new Set(ids)];
-    if (uniqueIds.length > this.maxPromptImages) {
+    if (uniqueIds.length > this.maxPromptAttachments) {
+      throw new Error(`每条消息最多附加 ${this.maxPromptAttachments} 个文件`);
+    }
+    const attachments = uniqueIds.map((id) => {
+      const stored = this.entries.get(id);
+      if (!stored || !this.get(id)) throw new Error("附件不存在或已过期，请重新上传");
+      return stored;
+    });
+    if (attachments.filter((entry) => entry.kind === "image").length > this.maxPromptImages) {
       throw new Error(`每条消息最多附加 ${this.maxPromptImages} 张图片`);
     }
-    const images = [];
-    for (const id of uniqueIds) {
-      const { meta, bytes } = await this.read(id);
-      images.push({ type: "image" as const, data: bytes.toString("base64"), mimeType: meta.mimeType });
+    if (attachments.reduce((length, entry) => length + (entry.textLength || 0), 0) > 200_000) {
+      throw new Error("附件文本总量不能超过 200000 字符，请拆分发送");
     }
-    return images;
+    const images = [];
+    const documents = [];
+    for (const attachment of attachments) {
+      if (attachment.kind === "image") {
+        const { meta, bytes } = await this.read(attachment.id);
+        images.push({ type: "image" as const, data: bytes.toString("base64"), mimeType: meta.mimeType });
+      } else {
+        const text = attachment.text!;
+        let fenceLength = 3;
+        for (const match of text.matchAll(/`+/g)) fenceLength = Math.max(fenceLength, match[0].length + 1);
+        const fence = "`".repeat(fenceLength);
+        documents.push(`附件：${JSON.stringify(attachment.name)}\n${fence}text\n${text}\n${fence}`);
+      }
+    }
+    return {
+      message: [message.trim() || (documents.length ? "请分析附加文件。" : "请分析附加图片。"), ...documents].join("\n\n"),
+      images,
+    };
   }
 
   async remove(id: string): Promise<boolean> {
@@ -149,9 +189,12 @@ export class ImageAttachmentStore {
     await Promise.all([...this.entries.keys()].map((id) => this.remove(id)));
   }
 
-  private meta(stored: StoredImageAttachment): ImageAttachmentMeta {
+  private meta(stored: StoredAttachment): AttachmentMeta {
     return {
       id: stored.id,
+      kind: stored.kind,
+      name: stored.name,
+      ...(stored.textLength !== undefined ? { textLength: stored.textLength } : {}),
       mimeType: stored.mimeType,
       size: stored.size,
       createdAt: stored.createdAt,

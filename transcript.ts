@@ -36,6 +36,19 @@ export interface RenderedMessage {
   willRetry?: boolean;
 }
 
+export function browserMessages(messages: RenderedMessage[]): RenderedMessage[] {
+  return messages.map((message) => !message.blocks ? message : {
+    ...message,
+    blocks: message.blocks.map((block) => {
+      if (block.type !== "toolCall") return block;
+      const { arguments: _arguments, result, ...visible } = block;
+      return result
+        ? { ...visible, result: { content: result.content, isError: result.isError } }
+        : visible;
+    }),
+  });
+}
+
 function timestampValue(value: unknown): string | number | undefined {
   return typeof value === "string" || typeof value === "number" ? value : undefined;
 }

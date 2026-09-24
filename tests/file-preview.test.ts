@@ -8,6 +8,8 @@ test("highlights known source files and escapes source markup", () => {
   assert.equal(preview.name, "sample.ts");
   assert.equal(preview.language, "typescript");
   assert.equal(preview.highlighted, true);
+  assert.equal(preview.kind, "code");
+  assert.equal(preview.content, undefined);
   assert.equal(preview.lineCount, 2);
   assert.match(preview.highlightedHtml, /hljs-keyword/);
   assert.ok(!preview.highlightedHtml.includes("<tag>"));
@@ -22,6 +24,15 @@ test("uses plain escaped text for files above the highlighting limit", () => {
   assert.equal(preview.highlighted, false);
   assert.ok(!preview.highlightedHtml.includes("<unsafe>"));
   assert.match(preview.highlightedHtml, /&lt;unsafe&gt;/);
+});
+
+test("provides normalized content for rendered Markdown and HTML previews", () => {
+  for (const [name, kind] of [["note.md", "markdown"], ["page.HTML", "html"], ["page.htm", "html"]]) {
+    const preview = buildFilePreview(`C:\\project\\${name}`, Buffer.from("\uFEFF# Heading\r\n<main>content</main>"));
+    assert.equal(preview.kind, kind);
+    assert.equal(preview.content, "# Heading\n<main>content</main>");
+  }
+  assert.equal(buildFilePreview("C:\\project\\image.svg", Buffer.from("<svg></svg>")).kind, "code");
 });
 
 test("recognizes PowerShell files", () => {

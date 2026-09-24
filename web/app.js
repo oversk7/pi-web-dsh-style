@@ -1,5 +1,8 @@
 "use strict";
 
+import { markdown } from "./assets/markdown.js";
+import { webSlashCommands, unsupportedSlashCommands, parseSlashCommand } from "./slash-commands.js";
+
 const SESSION_PREVIEW_LIMIT = 5;
 const MODEL_REFRESH_TTL_MS = 60_000;
 const WORKSPACE_ORDER_STORAGE_KEY = "pi-web-workspace-order";
@@ -14,6 +17,7 @@ const S = {
   currentSessionId: null,
   snapshots: new Map(),
   newSessionSnapshot: null,
+  newSessionPreferenceWorkspaceId: null,
   collapsed: new Set(),
   expandedSessionLists: new Set(),
   sidebarCollapsed: localStorage.getItem("pi-web-sidebar-collapsed") === "1",
@@ -23,10 +27,12 @@ const S = {
   filePreviewWidth: Number(localStorage.getItem("pi-web-file-preview-width")) || 520,
   filePreviewGeneration: 0,
   expandedTools: new Set(),
+  expandedThinking: new Set(),
   expandedCompactions: new Set(),
   search: "",
   searchOpen: false,
   loadingSession: null,
+  pendingCreation: null,
   pendingSends: new Map(),
   withdrawingQueueItems: new Set(),
   dequeueSessions: new Set(),
@@ -48,6 +54,7 @@ const S = {
   historyGeneration: 0,
   clipboardBusy: false,
   settingsOpen: false,
+  settingsTab: "appearance",
   maintenanceBusy: null,
   maintenanceMessage: null,
   maintenanceGeneration: 0,
@@ -57,6 +64,11 @@ const S = {
   lanUrls: [],
   passwordConfigured: false,
   theme: localStorage.getItem("pi-web-theme") || "system",
+  themeStyle: localStorage.getItem("pi-web-theme-style") || "classic",
+  backgroundUrl: null,
+  backgroundName: "",
+  backgroundBusy: false,
+  backgroundError: "",
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -126,16 +138,104 @@ function shortPath(path, max = 34) {
   return path.length > max ? `…${path.slice(path.length - max)}` : path;
 }
 
-function setTheme(theme) {
-  S.theme = theme;
-  localStorage.setItem("pi-web-theme", theme);
-  const dark = theme === "dark" || (theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+function applyTheme() {
+  const dark = S.theme === "dark" || (S.theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.style.colorScheme = dark ? "dark" : "light";
   document.body.toggleAttribute("data-ds-dark-theme", dark);
+  document.body.dataset.themeStyle = S.themeStyle;
+}
+
+function setTheme(theme) {
+  S.theme = ["light", "dark", "system"].includes(theme) ? theme : "system";
+  localStorage.setItem("pi-web-theme", S.theme);
+  applyTheme();
+}
+
+function setThemeStyle(style) {
+  S.themeStyle = ["classic", "sakura", "starlight"].includes(style) ? style : "classic";
+  localStorage.setItem("pi-web-theme-style", S.themeStyle);
+  applyTheme();
 }
 
 function toggleTheme() {
   setTheme(document.body.hasAttribute("data-ds-dark-theme") ? "light" : "dark");
+}
+
+function backgroundStorage(mode, value) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open("pi-web-appearance", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("background");
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      const transaction = db.transaction("background", mode === "read" ? "readonly" : "readwrite");
+      const store = transaction.objectStore("background");
+      const operation = mode === "read" ? store.get("custom") : value ? store.put(value, "custom") : store.delete("custom");
+      transaction.oncomplete = () => { db.close(); resolve(operation.result); };
+      transaction.onabort = () => { db.close(); reject(transaction.error || operation.error); };
+    };
+  });
+}
+
+function applyCustomBackground(background) {
+  const previous = S.backgroundUrl;
+  S.backgroundUrl = background ? URL.createObjectURL(background.blob) : null;
+  S.backgroundName = background?.name || "";
+  document.body.toggleAttribute("data-custom-background", Boolean(S.backgroundUrl));
+  if (S.backgroundUrl) document.body.style.setProperty("--pi-background-image", `url("${S.backgroundUrl}")`);
+  else document.body.style.removeProperty("--pi-background-image");
+  if (previous) URL.revokeObjectURL(previous);
+}
+
+async function restoreCustomBackground() {
+  S.backgroundBusy = true;
+  try {
+    const background = await backgroundStorage("read");
+    if (background) applyCustomBackground(background);
+  } catch {
+    S.backgroundError = "无法读取本地背景，请检查浏览器的存储权限。";
+  } finally {
+    S.backgroundBusy = false;
+    if (S.settingsOpen) renderOverlay();
+  }
+}
+
+async function prepareBackground(file) {
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) throw new Error("请选择 PNG、JPEG 或 WebP 图片。");
+  if (file.size > 10 * 1024 * 1024) throw new Error("图片不能超过 10 MB。");
+  const image = new Image();
+  const url = URL.createObjectURL(file);
+  try {
+    image.src = url;
+    await image.decode();
+    const scale = Math.min(1, 2560 / Math.max(image.naturalWidth, image.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/webp", .9));
+    if (!blob) throw new Error("图片处理失败，请尝试其他图片。");
+    return { blob, name: file.name };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function changeCustomBackground(file = null) {
+  if (S.backgroundBusy) return;
+  S.backgroundBusy = true;
+  S.backgroundError = "";
+  renderOverlay();
+  try {
+    const background = file ? await prepareBackground(file) : null;
+    await backgroundStorage("write", background);
+    applyCustomBackground(background);
+  } catch (error) {
+    S.backgroundError = `背景未更改：${error.message || "无法保存图片，请检查浏览器的存储空间与权限。"}`;
+  } finally {
+    S.backgroundBusy = false;
+    renderOverlay();
+  }
 }
 
 const ICONS = {
@@ -147,6 +247,9 @@ const ICONS = {
   folder: `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2.5 3.5C2.5 2.95 2.95 2.5 3.5 2.5H6L7.5 4.5H12.5C13.05 4.5 13.5 4.95 13.5 5.5V12.5C13.5 13.05 13.05 13.5 12.5 13.5H3.5C2.95 13.5 2.5 13.05 2.5 12.5V3.5Z" stroke="currentColor" stroke-width="1.2"/></svg>`,
   grip: `<svg width="12" height="16" viewBox="0 0 12 16" fill="none" aria-hidden="true"><circle cx="3" cy="4" r="1" fill="currentColor"/><circle cx="9" cy="4" r="1" fill="currentColor"/><circle cx="3" cy="8" r="1" fill="currentColor"/><circle cx="9" cy="8" r="1" fill="currentColor"/><circle cx="3" cy="12" r="1" fill="currentColor"/><circle cx="9" cy="12" r="1" fill="currentColor"/></svg>`,
   chevron: `<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M4.25 2.83V11.17C4.25 11.66 4.84 11.91 5.19 11.56L9.36 7.39C9.58 7.17 9.58 6.83 9.36 6.61L5.19 2.44C4.84 2.09 4.25 2.34 4.25 2.83Z" fill="currentColor"/></svg>`,
+  appearance: `<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="6.8" stroke="currentColor" stroke-width="1.4"/><path d="M10 3.2a6.8 6.8 0 0 1 0 13.6Z" fill="currentColor"/></svg>`,
+  network: `<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><rect x="2.5" y="3" width="15" height="10" rx="2" stroke="currentColor" stroke-width="1.4"/><path d="M10 13v4m-4 0h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`,
+  shield: `<svg width="18" height="18" viewBox="0 0 20 20" fill="none"><path d="m10 2 6.5 2.5V9c0 4-2.6 6.7-6.5 9-3.9-2.3-6.5-5-6.5-9V4.5L10 2Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="m7 9.5 2 2 4-4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
   gear: `<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.2" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.5V3M8 13V14.5M14.5 8H13M3 8H1.5M12.6 3.4L11.5 4.5M4.5 11.5L3.4 12.6M12.6 12.6L11.5 11.5M4.5 4.5L3.4 3.4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`,
   send: `<svg viewBox="0 0 16 16" width="16" height="16" fill="none"><path d="M1.5 14.5L14.5 8L1.5 1.5L4.5 8L1.5 14.5Z" fill="currentColor"/></svg>`,
   stop: `<svg viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="3" y="3" width="10" height="10" rx="1.5" fill="currentColor"/></svg>`,
@@ -212,6 +315,7 @@ function currentSnapshot() {
 }
 
 function draftKey(sessionId = S.currentSessionId, workspaceId = S.currentWorkspaceId) {
+  if (!sessionId && S.pendingCreation?.generation === S.openGeneration && workspaceId === S.pendingCreation.workspaceId) return S.pendingCreation.draftKey;
   return sessionId ? `session:${sessionId}` : `new:${workspaceId || "default"}`;
 }
 
@@ -254,18 +358,7 @@ function thinkingLabel(level) {
   return { off: "Off", minimal: "Min", low: "Low", medium: "Med", high: "High", xhigh: "X-High", max: "Max" }[level] || level;
 }
 
-const WEB_SLASH_COMMANDS = [
-  { name: "settings", description: "打开界面与运行时设置", source: "builtin", local: true },
-  { name: "model", description: "选择当前模型", source: "builtin", local: true },
-  { name: "export", description: "将当前会话导出为 HTML", source: "builtin", local: true },
-  { name: "copy", description: "复制最后一条助手回复", source: "builtin", local: true },
-  { name: "name", description: "设置当前会话名称", source: "builtin", local: true },
-  { name: "session", description: "显示会话统计信息", source: "builtin", local: true },
-  { name: "new", description: "在当前工作区创建新会话", source: "builtin", local: true },
-  { name: "rewind", description: "回溯对话，可选择同步恢复文件", source: "builtin", local: true },
-  { name: "tree", description: "打开当前会话的分支树", source: "builtin", local: true },
-  { name: "compact", description: "手动压缩当前会话上下文", source: "builtin", local: true },
-];
+const WEB_SLASH_COMMANDS = webSlashCommands;
 
 function commandSourceLabel(source) {
   return { builtin: "内置", prompt: "模板", extension: "扩展", skill: "技能" }[source] || source || "命令";
@@ -329,6 +422,10 @@ function usesTouchInput() {
   return matchMedia("(pointer: coarse)").matches;
 }
 
+function usesMobileFilePreview() {
+  return matchMedia("(max-width: 640px), (pointer: coarse) and (max-width: 900px)").matches;
+}
+
 function updateViewport() {
   const viewport = window.visualViewport;
   if (viewport && viewport.scale !== 1) return;
@@ -361,8 +458,24 @@ function applyFrameLayout() {
   const { sidebarWidth, previewWidth } = currentPanelWidths();
   frame.dataset.sidebarCollapsed = String(mobileSidebar || S.sidebarCollapsed);
   frame.toggleAttribute("data-mobile-sidebar-open", mobileSidebar && S.mobileSidebarOpen);
+  const mobilePreview = Boolean(S.filePreview && usesMobileFilePreview());
   const sidebar = $(".pI_x6G_sidebarCol", frame);
-  if (sidebar) sidebar.inert = mobileSidebar && !S.mobileSidebarOpen;
+  if (sidebar) sidebar.inert = mobilePreview || (mobileSidebar && !S.mobileSidebarOpen);
+  const conversation = $(".pI_x6G_centerCol", frame);
+  if (conversation) conversation.inert = mobilePreview;
+  const preview = $(".pI_x6G_detailsCol", frame);
+  if (preview) {
+    preview.inert = !S.filePreview;
+    if (mobilePreview) {
+      preview.setAttribute("role", "dialog");
+      preview.setAttribute("aria-modal", "true");
+      preview.setAttribute("aria-label", "文件预览");
+    } else {
+      preview.removeAttribute("role");
+      preview.removeAttribute("aria-modal");
+      preview.removeAttribute("aria-label");
+    }
+  }
   frame.toggleAttribute("data-details-collapsed", !S.filePreview);
   frame.style.setProperty("--pi-sidebar-width", `${sidebarWidth}px`);
   frame.style.setProperty("--pi-details-width", `${previewWidth}px`);
@@ -390,6 +503,11 @@ function formatFileBytes(size) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function htmlPreviewDocument(content) {
+  const policy = "default-src 'none'; script-src 'unsafe-inline' https: http:; style-src 'unsafe-inline' https: http:; img-src data: blob: https: http:; font-src data: https: http:; base-uri 'none'; form-action 'none'";
+  return `<!doctype html><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${esc(policy)}">${content}`;
+}
+
 function renderFilePreview() {
   const mount = $("#filePreviewMount");
   if (!mount) return;
@@ -399,6 +517,8 @@ function renderFilePreview() {
     return;
   }
   const name = preview.name || fileNameFromPath(preview.path);
+  const canRender = ["markdown", "html"].includes(preview.kind);
+  const showRendered = canRender && preview.mode !== "source";
   const metadata = preview.loading
     ? "正在读取"
     : preview.error
@@ -407,6 +527,10 @@ function renderFilePreview() {
   let body = `<div class="pi-filePreviewState"><span class="pi-filePreviewSpinner" aria-hidden="true"></span>正在加载文件…</div>`;
   if (preview.error) {
     body = `<div class="pi-filePreviewState pi-filePreviewError"><strong>文件预览失败</strong><span>${esc(preview.error)}</span></div>`;
+  } else if (!preview.loading && showRendered) {
+    body = preview.kind === "markdown"
+      ? `<div class="pi-filePreviewScroll" tabindex="0" aria-label="${esc(name)} 预览"><article class="pi-filePreviewMarkdown _markdown_1nba0_5">${markdown(preview.content)}</article></div>`
+      : `<iframe class="pi-filePreviewHtml" title="${esc(name)} 预览" sandbox="allow-scripts" referrerpolicy="no-referrer" srcdoc="${esc(htmlPreviewDocument(preview.content))}"></iframe>`;
   } else if (!preview.loading) {
     const lineCount = Math.max(1, Number(preview.lineCount) || 1);
     const requestedLine = Number(preview.line);
@@ -427,16 +551,18 @@ function renderFilePreview() {
   }
   mount.innerHTML = `<section class="pi-filePreview" aria-label="文件预览">
     <header class="pi-filePreviewHeader">
+      <button type="button" class="pi-filePreviewIcon pi-filePreviewBack" data-action="file-preview-close" aria-label="返回对话"><span aria-hidden="true">‹</span>返回</button>
       <div class="pi-filePreviewHeading">
         <strong title="${esc(preview.path)}">${esc(name)}</strong>
         <span title="${esc(preview.path)}">${esc(preview.path)}</span>
       </div>
       <div class="pi-filePreviewActions">
+        ${canRender && !preview.loading && !preview.error ? `<button type="button" class="pi-filePreviewIcon pi-filePreviewMode" data-action="file-preview-mode" title="${showRendered ? "查看源码" : "查看预览"}">${showRendered ? "源码" : "预览"}</button>` : ""}
         <button type="button" class="pi-filePreviewIcon" data-action="file-preview-reveal" title="在系统文件管理器中定位" aria-label="在系统文件管理器中定位">${ICONS.folderOpen}</button>
         <button type="button" class="pi-filePreviewIcon pi-filePreviewClose" data-action="file-preview-close" title="关闭预览" aria-label="关闭预览">×</button>
       </div>
     </header>
-    <div class="pi-filePreviewMeta">${esc(metadata)}${!preview.loading && !preview.error && !preview.highlighted ? " · 纯文本模式" : ""}</div>
+    <div class="pi-filePreviewMeta">${esc(metadata)}${!preview.loading && !preview.error && !showRendered && !preview.highlighted ? " · 纯文本模式" : ""}</div>
     <div class="pi-filePreviewBody">${body}</div>
   </section>`;
 }
@@ -444,18 +570,26 @@ function renderFilePreview() {
 function scrollFilePreviewToLine() {
   const preview = S.filePreview;
   const scroll = $(".pi-filePreviewScroll");
-  if (!preview || !scroll || !preview.line) return;
+  if (!preview || !scroll || !preview.line || !$(".pi-filePreviewSource", scroll)) return;
   const lineTop = (Math.max(1, Number(preview.line)) - 1) * 21 + 12;
   scroll.scrollTop = Math.max(0, lineTop - scroll.clientHeight / 3);
 }
 
-async function openFilePreview(path, line, href) {
+let filePreviewReturnFocus = null;
+
+async function openFilePreview(path, line, href, trigger = document.activeElement) {
+  const mobile = usesMobileFilePreview();
+  if (mobile) {
+    if (!S.filePreview) filePreviewReturnFocus = trigger;
+    S.mobileSidebarOpen = false;
+  }
   const requestedLine = Number(line);
   const normalizedLine = Number.isFinite(requestedLine) && requestedLine > 0 ? Math.max(1, requestedLine) : null;
   if (S.filePreview?.path === path && !S.filePreview.error) {
     S.filePreview = { ...S.filePreview, line: normalizedLine, href };
     applyFrameLayout();
     renderFilePreview();
+    if (mobile) $(".pI_x6G_detailsCol")?.focus({ preventScroll: true });
     requestAnimationFrame(scrollFilePreviewToLine);
     return;
   }
@@ -464,6 +598,7 @@ async function openFilePreview(path, line, href) {
   S.filePreview = { path, line: normalizedLine, href, name: fileNameFromPath(path), loading: true };
   applyFrameLayout();
   renderFilePreview();
+  if (mobile) $(".pI_x6G_detailsCol")?.focus({ preventScroll: true });
   try {
     const data = await api(`/api/fs/view?path=${encodeURIComponent(path)}&format=json`);
     if (generation !== S.filePreviewGeneration) return;
@@ -482,6 +617,8 @@ function closeFilePreview() {
   S.filePreview = null;
   renderFilePreview();
   applyFrameLayout();
+  if (filePreviewReturnFocus?.isConnected) filePreviewReturnFocus.focus({ preventScroll: true });
+  filePreviewReturnFocus = null;
 }
 
 function renderApp() {
@@ -492,7 +629,7 @@ function renderApp() {
       <div class="pI_x6G_sidebarCol"><div id="sidebarMount"></div></div>
       <button type="button" class="pi-mobileSidebarBackdrop" aria-label="关闭侧边栏" data-action="close-mobile-sidebar"></button>
       <div class="pI_x6G_centerCol"><div id="conversationMount" class="wSkVaW_root"></div></div>
-      <div class="pI_x6G_detailsCol"><div id="filePreviewMount"></div></div>
+      <div class="pI_x6G_detailsCol" tabindex="-1"><div id="filePreviewMount"></div></div>
       <div class="pI_x6G_overlayLayer" id="overlayMount"></div>
       <div class="pI_x6G_handle" data-side="sidebar" role="separator" aria-label="调整侧边栏宽度" aria-orientation="vertical" aria-valuemin="220" aria-valuemax="420" tabindex="0"></div>
       <div class="pI_x6G_handle" data-side="details" role="separator" aria-label="调整文件预览宽度" aria-orientation="vertical" aria-valuemin="320" aria-valuemax="960" tabindex="0"></div>
@@ -672,7 +809,7 @@ function renderHero() {
               <span class="pXSMma_headlineText">和你的代码库对话</span>
               <span class="pXSMma_previewBadge">Web 预览版</span>
             </div>
-            <div class="pXSMma_body"></div>
+            <div class="pXSMma_body">${S.pendingCreation?.generation === S.openGeneration ? '<div class="gdEzaW_retryRow" role="status"><span class="gdEzaW_retryText">正在创建会话…</span></div>' : ""}</div>
           </div></div>
           <div class="wSkVaW_heroWorkspaceRow">
             <div class="pXSMma_workspaceRow">${renderWorkspacePicker()}</div>
@@ -704,15 +841,23 @@ function renderCommandMenu(snap = currentSnapshot()) {
   return `<div class="_3e4SsG_menu pi-commandMenu" role="listbox" aria-label="斜杠命令"><div class="_3e4SsG_viewport">${rows || status}</div></div>`;
 }
 
+function isImageAttachment(attachment) {
+  return attachment.mimeType?.startsWith("image/") && attachment.kind !== "document";
+}
+
 function renderDraftAttachments(model) {
-  if (!S.draftAttachments.length) return "";
-  const items = S.draftAttachments.map((attachment, index) => `<div class="pi-attachmentItem">
-    <img src="${esc(attachment.url)}" alt="附件图片 ${index + 1}">
-    <span class="pi-attachmentMeta">${index + 1}</span>
-    <button type="button" class="pi-attachmentRemove" data-action="remove-attachment" data-attachment-id="${esc(attachment.id)}" aria-label="移除第 ${index + 1} 张图片" title="移除图片">${ICONS.close}</button>
-  </div>`).join("");
-  const warning = modelSupportsImages(model) ? "" : `<span class="pi-attachmentWarning">当前模型不支持图片输入</span>`;
-  return `<div class="pi-attachmentTray" aria-label="待发送图片">${items}${warning}</div>`;
+  if (!S.draftAttachments.length && !S.clipboardBusy) return "";
+  const items = S.draftAttachments.map((attachment, index) => {
+    const image = isImageAttachment(attachment);
+    const name = attachment.name || `图片 ${index + 1}`;
+    return `<div class="pi-attachmentItem ${image ? "" : "pi-fileAttachment"}" title="${esc(name)}">
+      ${image ? `<img src="${esc(attachment.url)}" alt="${esc(name)}"><span class="pi-attachmentMeta">${index + 1}</span>` : `<span class="pi-fileAttachmentName">${esc(name)}</span><span class="pi-fileAttachmentInfo">已解析 · ${fmtNum(attachment.textLength || 0)} 字符</span>`}
+      <button type="button" class="pi-attachmentRemove" data-action="remove-attachment" data-attachment-id="${esc(attachment.id)}" aria-label="移除 ${esc(name)}" title="移除附件">${ICONS.close}</button>
+    </div>`;
+  }).join("");
+  const warning = S.draftAttachments.some(isImageAttachment) && !modelSupportsImages(model) ? `<span class="pi-attachmentWarning">当前模型不支持图片输入</span>` : "";
+  const progress = S.clipboardBusy ? `<span class="pi-attachmentProgress" role="status">正在读取并解析文件…</span>` : "";
+  return `<div class="pi-attachmentTray" aria-label="待发送附件">${items}${progress}${warning}</div>`;
 }
 
 function renderComposerBar(hero = false) {
@@ -722,7 +867,7 @@ function renderComposerBar(hero = false) {
   const level = state.thinkingLevel || null;
   const streaming = Boolean(snap.session?.streaming);
   const waitingForDialog = Boolean(snap.dialogs?.length);
-  const disabled = (!S.currentSessionId && !hero) || Boolean(S.loadingSession && !hero) || waitingForDialog;
+  const disabled = (!S.currentSessionId && !hero) || Boolean(S.loadingSession && !hero) || S.pendingCreation?.generation === S.openGeneration || waitingForDialog;
   const inputPlaceholder = waitingForDialog ? "请先回答对话中的问题" : "给智能体发消息";
   const rawContextPct = snap.stats?.contextUsage?.percent;
   const hasContextPct = typeof rawContextPct === "number" && Number.isFinite(rawContextPct);
@@ -740,7 +885,7 @@ function renderComposerBar(hero = false) {
           </div></div>
           <div class="uV2eYG_row">
             <div class="uV2eYG_tools">
-              <button type="button" class="uV2eYG_add" aria-label="命令" title="命令" data-action="commands" ${disabled ? "disabled" : ""}>${ICONS.plus}</button>
+              <button type="button" class="uV2eYG_add" aria-label="上传文件" title="上传文件（文本、代码、PDF、DOCX、XLSX、PPTX、图片）" data-action="upload-files" ${disabled || S.clipboardBusy ? "disabled" : ""}>${ICONS.plus}</button>
               <button type="button" class="uV2eYG_add pi-imagePaste" aria-label="${S.localClient ? "粘贴剪贴板图片" : "选择图片"}" title="${modelSupportsImages(model) ? (S.localClient ? "粘贴剪贴板图片（Alt+V）" : "从手机选择图片") : "当前模型不支持图片输入"}" data-action="paste-image" ${disabled || S.clipboardBusy || !modelSupportsImages(model) ? "disabled" : ""}>${ICONS.image}</button>
             </div>
             <div class="uV2eYG_trailing">
@@ -760,7 +905,7 @@ function renderComposerBar(hero = false) {
               ${hero ? "" : `<span class="JObwrW_root"><button type="button" class="JObwrW_trigger" aria-label="${contextLabel}" title="${contextLabel}" data-action="context-info"><svg viewBox="0 0 14 14" width="14" height="14" aria-hidden="true"><circle class="JObwrW_track" cx="7" cy="7" r="5.5"></circle><circle class="JObwrW_fill" cx="7" cy="7" r="5.5" stroke-dasharray="${(contextPct * 34.56 / 100).toFixed(2)} 34.56" transform="rotate(-90 7 7)"></circle></svg></button></span>`}
               <span class="pi-composerActions">
                 ${streaming ? `<button type="button" class="pi-abortButton" aria-label="停止生成" title="停止生成" data-action="abort">${ICONS.stop}</button>` : ""}
-                <button type="button" class="uV2eYG_primary" aria-label="${streaming ? "插入消息" : "发送消息"}" title="${streaming ? "插入消息" : "发送消息"}" data-action="send" ${disabled ? "disabled" : ""}>${ICONS.send}</button>
+                <button type="button" class="uV2eYG_primary" aria-label="${streaming ? "插入消息" : "发送消息"}" title="${streaming ? "插入消息" : "发送消息"}" data-action="send" ${disabled || S.clipboardBusy ? "disabled" : ""}>${ICONS.send}</button>
               </span>
             </div>
           </div>
@@ -788,8 +933,8 @@ function renderStats(snap) {
   const tokens = stats.tokens || {};
   const cu = stats.contextUsage || {};
   const parts = [];
-  const add = (text, className = "") => {
-    if (text !== "" && text != null) parts.push({ text: String(text), className });
+  const add = (text, className = "", action = "") => {
+    if (text !== "" && text != null) parts.push({ text: String(text), className, action });
   };
   if (cu.tokens != null) add(`上下文 ${fmtNum(cu.tokens)}/${fmtNum(cu.contextWindow ?? 0)} (${Math.round(cu.percent ?? 0)}%)`, "FJxK0a_context");
   const pendingMessages = Number(snap.state?.pendingMessageCount ?? 0);
@@ -800,11 +945,91 @@ function renderStats(snap) {
   if (Number(tokens.cacheWrite) > 0) cacheParts.push(`写 ${fmtNum(tokens.cacheWrite)}`);
   if (cacheParts.length) add(cacheParts.join(" · "));
   if (typeof stats.cost === "number") add(formatCost(stats.cost));
-  for (const [, text] of Object.entries(snap.extensionStatuses || {}).sort(([a], [b]) => a.localeCompare(b))) {
-    add(text, extensionStatusClass(text));
+  for (const [key, text] of Object.entries(snap.extensionStatuses || {}).sort(([a], [b]) => a.localeCompare(b))) {
+    add(text, extensionStatusClass(text), key === "pwsh-bg" ? "background-jobs" : "");
   }
   if (!parts.length) return "";
-  return `<div class="FJxK0a_root" role="status">${parts.map((part) => `<span class="${part.className}" title="${esc(part.text)}">${esc(part.text)}</span>`).join('<span class="FJxK0a_sep" aria-hidden="true">|</span>')}</div>`;
+  return `<div class="FJxK0a_root" role="status">${parts.map((part) => part.action
+    ? `<button type="button" class="${part.className} pi-backgroundJobsTrigger" data-action="${part.action}" aria-haspopup="dialog" title="查看后台任务日志">${esc(part.text)}</button>`
+    : `<span class="${part.className}" title="${esc(part.text)}">${esc(part.text)}</span>`).join('<span class="FJxK0a_sep" aria-hidden="true">|</span>')}</div>`;
+}
+
+function backgroundJobLabel(job) {
+  return job.name ? `${job.name} (${job.jobId})` : job.jobId;
+}
+
+function openBackgroundJobs() {
+  if (!S.currentSessionId) return;
+  const sessionId = S.currentSessionId;
+  const trigger = document.activeElement;
+  const dialog = el(`<dialog class="pi-backgroundJobs" aria-labelledby="pi-backgroundJobs-title">
+    <header class="pi-backgroundJobsHeader"><strong id="pi-backgroundJobs-title">后台任务日志</strong><button type="button" class="pi-filePreviewIcon" aria-label="关闭日志">×</button></header>
+    <label class="pi-backgroundJobsPicker">任务<select aria-label="选择后台任务"></select></label>
+    <div class="pi-backgroundJobsCommand"></div>
+    <div class="pi-backgroundJobsStatus" role="status">正在加载…</div>
+    <pre class="pi-backgroundJobsOutput" tabindex="0" aria-label="运行日志"></pre>
+  </dialog>`);
+  const select = $("select", dialog);
+  const output = $(".pi-backgroundJobsOutput", dialog);
+  const status = $(".pi-backgroundJobsStatus", dialog);
+  const controller = new AbortController();
+  let timer;
+  let selection = "";
+  let generation = 0;
+  let closed = false;
+  let jobs = [];
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    controller.abort();
+    dialog.remove();
+    if (trigger?.isConnected) trigger.focus({ preventScroll: true });
+  };
+  const refresh = async () => {
+    clearTimeout(timer);
+    const request = ++generation;
+    try {
+      const query = selection ? `?job=${encodeURIComponent(selection)}` : "";
+      const data = await api(`/api/sessions/${encodeURIComponent(sessionId)}/background-jobs${query}`, { signal: controller.signal });
+      if (closed || request !== generation) return;
+      jobs = data.jobs || [];
+      const options = jobs.map((job) => `<option value="${esc(job.id)}">${esc(backgroundJobLabel(job))}</option>`).join("");
+      if (select.innerHTML !== options) select.innerHTML = options;
+      const changed = selection !== (data.job?.id || "");
+      selection = data.job?.id || "";
+      select.value = selection;
+      select.disabled = !jobs.length;
+      $(".pi-backgroundJobsCommand", dialog).textContent = data.job?.command || "";
+      status.textContent = data.error || (!jobs.length ? "当前会话暂无后台任务" : `自动刷新${data.truncated ? " · 仅显示最近的日志" : ""}`);
+      const follow = changed || output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+      const text = data.output || (data.error ? "" : jobs.length ? "暂无输出，等待任务产生日志…" : "");
+      if (output.textContent !== text) output.textContent = text;
+      if (follow) output.scrollTop = output.scrollHeight;
+    } catch (error) {
+      if (closed || request !== generation) return;
+      status.textContent = `读取日志失败：${error.message || String(error)}`;
+    } finally {
+      if (!closed && request === generation) timer = setTimeout(refresh, 1500);
+    }
+  };
+  select.addEventListener("change", () => {
+    selection = select.value;
+    output.textContent = "";
+    status.textContent = "正在加载…";
+    void refresh();
+  });
+  $("button", dialog).addEventListener("click", () => dialog.close());
+  dialog.addEventListener("close", close);
+  dialog.addEventListener("click", (event) => {
+    if (event.target !== dialog) return;
+    const rect = dialog.getBoundingClientRect();
+    if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
+  });
+  dialog.addEventListener("keydown", (event) => event.stopPropagation());
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  void refresh();
 }
 
 function formatCost(cost) {
@@ -889,7 +1114,7 @@ function messageFlowParts() {
     return {
       key,
       revision,
-      render: () => `<div class="pi-messageGroup" data-flow-key="${key}" data-flow-revision="${revision}"${anchor}>${renderMessage(message, index)}</div>`,
+      render: () => `<div class="pi-messageGroup" data-message-index="${index}" data-flow-key="${key}" data-flow-revision="${revision}"${anchor}>${renderMessage(message, index)}</div>`,
     };
   });
   for (const entry of pendingQueueEntries(snap)) {
@@ -1030,6 +1255,33 @@ function reconcileConversationNavigator(stage) {
 let conversationNavFrame = 0;
 let conversationNavScroll = null;
 let conversationNavObserver = null;
+let conversationFollowingBottom = true;
+let conversationLastScrollTop = 0;
+let conversationTouchY = null;
+
+function onConversationScroll() {
+  const scroll = conversationNavScroll;
+  if (!scroll) return;
+  if (scroll.scrollTop < conversationLastScrollTop) conversationFollowingBottom = false;
+  else if (scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= 2) conversationFollowingBottom = true;
+  conversationLastScrollTop = scroll.scrollTop;
+  scheduleConversationNavigatorLayout();
+}
+
+function onConversationWheel(event) {
+  if (event.deltaY < 0) conversationFollowingBottom = false;
+}
+
+function onConversationTouchStart(event) {
+  conversationTouchY = event.touches[0]?.clientY ?? null;
+}
+
+function onConversationTouchMove(event) {
+  const y = event.touches[0]?.clientY;
+  if (y == null) return;
+  if (conversationTouchY != null && y > conversationTouchY) conversationFollowingBottom = false;
+  conversationTouchY = y;
+}
 
 function conversationTargetTop(scroll, target) {
   const scrollRect = scroll.getBoundingClientRect();
@@ -1088,9 +1340,17 @@ function bindConversationNavigator() {
   const bottomButton = $("[data-scroll-bottom]");
   const nextScroll = nav || bottomButton ? scroll : null;
   if (conversationNavScroll !== nextScroll) {
-    conversationNavScroll?.removeEventListener("scroll", scheduleConversationNavigatorLayout);
+    conversationNavScroll?.removeEventListener("scroll", onConversationScroll);
+    conversationNavScroll?.removeEventListener("wheel", onConversationWheel);
+    conversationNavScroll?.removeEventListener("touchstart", onConversationTouchStart);
+    conversationNavScroll?.removeEventListener("touchmove", onConversationTouchMove);
     conversationNavScroll = nextScroll;
-    conversationNavScroll?.addEventListener("scroll", scheduleConversationNavigatorLayout, { passive: true });
+    conversationFollowingBottom = true;
+    conversationLastScrollTop = nextScroll?.scrollTop || 0;
+    conversationNavScroll?.addEventListener("scroll", onConversationScroll, { passive: true });
+    conversationNavScroll?.addEventListener("wheel", onConversationWheel, { passive: true });
+    conversationNavScroll?.addEventListener("touchstart", onConversationTouchStart, { passive: true });
+    conversationNavScroll?.addEventListener("touchmove", onConversationTouchMove, { passive: true });
   }
   conversationNavObserver?.disconnect();
   conversationNavObserver = null;
@@ -1107,6 +1367,7 @@ function bindConversationNavigator() {
 function scrollConversationToBottom() {
   const scroll = $("[data-conversation-scroll]");
   if (!scroll) return;
+  conversationFollowingBottom = true;
   scroll.scrollTo({
     top: scroll.scrollHeight,
     behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
@@ -1120,6 +1381,7 @@ function jumpToConversationTurn(key) {
     .find((node) => node.dataset.flowKey === key);
   const target = group?.querySelector('[data-chat-flow-kind="user"]');
   if (!scroll || !target) return;
+  conversationFollowingBottom = false;
   const top = Math.max(0, conversationTargetTop(scroll, target) - 20);
   scroll.scrollTo({
     top,
@@ -1142,15 +1404,7 @@ function patchComposerState(activeComposer) {
   replaceSlot(".pi-thinkingControl");
   replaceSlot(".JObwrW_root");
   replaceSlot(".pi-composerActions");
-  const commandButton = $('[data-action="commands"]', activeComposer);
-  const nextCommandButton = $('[data-action="commands"]', nextComposer);
-  if (commandButton && nextCommandButton) commandButton.disabled = nextCommandButton.disabled;
-  const imageButton = $('[data-action="paste-image"]', activeComposer);
-  const nextImageButton = $('[data-action="paste-image"]', nextComposer);
-  if (imageButton && nextImageButton) {
-    imageButton.disabled = nextImageButton.disabled;
-    imageButton.title = nextImageButton.title;
-  }
+  replaceSlot(".uV2eYG_tools");
   const currentTray = $(".pi-attachmentTray", activeComposer);
   const nextTray = $(".pi-attachmentTray", nextComposer);
   if (currentTray && nextTray && !currentTray.isEqualNode(nextTray)) currentTray.replaceWith(nextTray);
@@ -1186,9 +1440,7 @@ function renderActive() {
     </div>`;
 }
 
-let conversationRenderGeneration = 0;
 function renderConversation() {
-  const renderGeneration = ++conversationRenderGeneration;
   const mount = $("#conversationMount");
   if (!mount) return;
   const previousInput = $("#composerInput");
@@ -1203,12 +1455,12 @@ function renderConversation() {
   const scrollState = previousScroll && previousSessionId === S.currentSessionId
     ? {
         top: previousScroll.scrollTop,
-        distanceFromBottom,
-        nearBottom: distanceFromBottom <= 96,
+        nearBottom: conversationFollowingBottom && distanceFromBottom <= 96,
       }
     : null;
   const activeRoot = $('.wSkVaW_root[data-phase="active"]', mount);
   const activeHeader = activeRoot && $(".wSkVaW_header", activeRoot);
+  const activeHistory = activeRoot && $(".pi-historyView", activeRoot);
   const activeStage = activeRoot && $(".pi-conversationStage", activeRoot);
   const activeView = activeRoot && $(".wSkVaW_viewArea", activeRoot);
   const activeComposer = activeRoot && $("[data-composer-seat]", activeRoot);
@@ -1225,6 +1477,12 @@ function renderConversation() {
   let patchedActive = false;
   if (!S.currentSessionId) {
     mount.innerHTML = `<div class="wSkVaW_root" data-phase="hero">${renderHeaderPlaceholder()}${renderHero()}</div>`;
+  } else if (S.conversationTab === "history" && activeHeader && activeHistory) {
+    const nextHeader = el(renderHeader());
+    if (!activeHeader.isEqualNode(nextHeader)) activeHeader.replaceWith(nextHeader);
+    const nextHistory = el(renderHistoryView(S.historyView));
+    if (!activeHistory.isEqualNode(nextHistory)) activeHistory.replaceWith(nextHistory);
+    patchedActive = true;
   } else if (canPatchActive) {
     const nextHeader = el(renderHeader());
     if (!activeHeader.isEqualNode(nextHeader)) activeHeader.replaceWith(nextHeader);
@@ -1251,23 +1509,18 @@ function renderConversation() {
     }
   }
   bindConversationNavigator();
-  const renderedSessionId = S.currentSessionId;
-  const restoreScroll = () => {
-    const scroll = $("[data-conversation-scroll]", mount);
-    if (!scroll || S.currentSessionId !== renderedSessionId || renderGeneration !== conversationRenderGeneration) return;
+  const scroll = $("[data-conversation-scroll]", mount);
+  if (scroll && S.currentSessionId && S.conversationTab === "conversation") {
     const maxScrollTop = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
-    if (!scrollState) {
+    if (!scrollState || scrollState.nearBottom) {
       scroll.scrollTop = maxScrollTop;
-    } else {
-      scroll.scrollTop = scrollState.nearBottom
-        ? Math.max(0, maxScrollTop - scrollState.distanceFromBottom)
-        : Math.min(scrollState.top, maxScrollTop);
+      conversationFollowingBottom = true;
+    } else if (!patchedActive) {
+      scroll.scrollTop = Math.min(scrollState.top, maxScrollTop);
+      conversationFollowingBottom = false;
     }
+    conversationLastScrollTop = scroll.scrollTop;
     scheduleConversationNavigatorLayout();
-  };
-  if (scrollState || (S.currentSessionId && S.conversationTab === "conversation")) {
-    restoreScroll();
-    requestAnimationFrame(restoreScroll);
   }
 }
 
@@ -1314,6 +1567,40 @@ function compactionUsageSummary(usage) {
   };
 }
 
+function renderMessageDetail(msg, blockIndex) {
+  if (msg.kind === "compaction") {
+    const usage = compactionUsageSummary(msg.usage);
+    const meta = [];
+    if (Number.isFinite(msg.tokensBefore)) meta.push(`<span>压缩前 <strong>${esc(fmtNum(msg.tokensBefore))}</strong> tok</span>`);
+    if (Number.isFinite(msg.estimatedTokensAfter)) meta.push(`<span>压缩后约 <strong>${esc(fmtNum(msg.estimatedTokensAfter))}</strong> tok</span>`);
+    if (usage) meta.push(`<span>摘要实际消耗 <strong>${esc(fmtNum(usage.totalTokens))}</strong> tok${usage.cost == null ? "" : ` · $${esc(usage.cost.toFixed(4))}`}</span>`);
+    if (msg.reason) meta.push(`<span>${esc(compactionReasonLabel(msg.reason))}</span>`);
+    return `${meta.length ? `<div class="pi-compactionMeta">${meta.join("")}</div>` : ""}${(msg.status || "complete") === "complete"
+      ? `<div class="pi-compactionBodyTitle">会话摘要</div><div class="pi-compactionMarkdown _markdown_1nba0_5">${markdown(msg.text || "")}</div>`
+      : `<div class="pi-compactionErrorDetail">${esc(msg.errorMessage || "")}</div>`}`;
+  }
+  const block = msg.blocks?.[blockIndex];
+  if (block?.type === "thinking") {
+    return `<div class="Y0dWHa_thinkingQuote"><pre class="Y0dWHa_payload">${esc(block.thinking || "")}</pre></div>`;
+  }
+  const argsText = block?.argumentsText || "";
+  const output = block?.result?.content || (msg.kind === "bashExecution" ? msg.output : msg.text) || "";
+  const isError = block ? block.result?.isError : msg.kind === "toolResult" && msg.isError;
+  return `<div class="Sxvs8a_body">${argsText ? `<pre class="Y0dWHa_payload">${esc(argsText)}</pre>` : ""}${output ? `<pre class="Y0dWHa_payload ${isError ? "Y0dWHa_payloadError" : ""}">${esc(output)}</pre>` : ""}</div>`;
+}
+
+function toggleMessageDetail(target, detail) {
+  if (!detail) return null;
+  const group = target.closest(".pi-messageGroup");
+  const message = currentSnapshot().messages?.[Number(group?.dataset.messageIndex)];
+  if (!message) return null;
+  const expanded = detail.hidden;
+  if (expanded) detail.innerHTML = renderMessageDetail(message, Number(detail.dataset.blockIndex));
+  else detail.replaceChildren();
+  detail.hidden = !expanded;
+  return expanded;
+}
+
 function renderCompactionMessage(msg) {
   const status = msg.status || "complete";
   const compactionKey = `compaction:${msg.id || msg.timestamp || msg.tokensBefore || "context"}`;
@@ -1345,17 +1632,7 @@ function renderCompactionMessage(msg) {
     metrics.push(reason, msg.errorMessage || "未返回错误详情");
     if (msg.willRetry) metrics.push("原请求仍会重试");
   }
-  const meta = [];
-  if (Number.isFinite(msg.tokensBefore)) meta.push(`<span>压缩前 <strong>${esc(fmtNum(msg.tokensBefore))}</strong> tok</span>`);
-  if (Number.isFinite(msg.estimatedTokensAfter)) meta.push(`<span>压缩后约 <strong>${esc(fmtNum(msg.estimatedTokensAfter))}</strong> tok</span>`);
-  if (usage) meta.push(`<span>摘要实际消耗 <strong>${esc(fmtNum(usage.totalTokens))}</strong> tok${usage.cost == null ? "" : ` · $${esc(usage.cost.toFixed(4))}`}</span>`);
-  if (msg.reason) meta.push(`<span>${esc(reason)}</span>`);
-  const detail = expandable ? `<div class="gdEzaW_compactionBody pi-compactionBody" ${expanded ? "" : "hidden"}>
-    ${meta.length ? `<div class="pi-compactionMeta">${meta.join("")}</div>` : ""}
-    ${status === "complete"
-      ? `<div class="pi-compactionBodyTitle">会话摘要</div><div class="pi-compactionMarkdown _markdown_1nba0_5">${markdown(detailText)}</div>`
-      : `<div class="pi-compactionErrorDetail">${esc(detailText)}</div>`}
-  </div>` : "";
+  const detail = expandable ? `<div class="gdEzaW_compactionBody pi-compactionBody" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg) : ""}</div>` : "";
   return `<div class="Md3f7G_flowItem" data-chat-flow-kind="compaction">
     <div class="gdEzaW_compactionRow pi-compactionCard" data-state="${esc(status)}" data-compaction-key="${esc(compactionKey)}" role="status" aria-live="polite">
       <button type="button" class="gdEzaW_compactionButton" ${expandable ? `data-action="toggle-compaction" aria-expanded="${expanded}"` : "disabled"}>
@@ -1409,7 +1686,7 @@ function renderMessage(msg, messageIndex) {
   }
   if (msg.kind === "assistant") {
     const blocks = msg.blocks || [];
-    const content = blocks.map((b, i) => renderBlock(b, msg, i)).join("");
+    const content = blocks.map((b, i) => renderBlock(b, msg, i, messageIndex)).join("");
     const error = msg.isError || msg.stopReason === "error" || msg.errorMessage
       ? renderAssistantError(msg)
       : "";
@@ -1431,7 +1708,7 @@ function renderMessage(msg, messageIndex) {
         <span class="CY-8Ka_leading">${ICONS.bash}</span><span class="CY-8Ka_title">${esc(msg.toolName || "Tool")}</span><span class="CY-8Ka_sep"></span>
         <span class="CY-8Ka_summary ${msg.isError ? "CY-8Ka_errorSummary" : ""}">${msg.isError ? "失败" : "完成"}${lineCount ? ` · ${lineCount} 行输出` : ""}</span>
       </div>
-      ${hasDetail ? `<div class="Sxvs8a_root" ${expanded ? "" : "hidden"}><div class="Sxvs8a_body"><pre class="Y0dWHa_payload ${msg.isError ? "Y0dWHa_payloadError" : ""}">${esc(output)}</pre></div></div>` : ""}
+      ${hasDetail ? `<div class="Sxvs8a_root" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg) : ""}</div>` : ""}
     </div></div></div>`;
   }
   if (msg.kind === "bashExecution") {
@@ -1441,23 +1718,25 @@ function renderMessage(msg, messageIndex) {
     const toolKey = `bash:${msg.timestamp || msg.command || "command"}`;
     const expanded = hasDetail && S.expandedTools.has(toolKey);
     return `<div class="Md3f7G_flowItem" data-chat-flow-kind="bash"><div class="ztWv_q_callRow" data-tool-key="${esc(toolKey)}"><div class="CY-8Ka_card"><div class="CY-8Ka_root" data-sample="bash" data-variant="bash" ${hasDetail ? `role="button" data-expandable aria-expanded="${expanded}" data-action="toggle-tool"` : ""}><span class="CY-8Ka_leading">${ICONS.bash}</span><span class="CY-8Ka_title">Bash</span><span class="CY-8Ka_sep"></span><span class="CY-8Ka_summary">${esc(msg.command || "")}${lineCount ? ` · ${lineCount} 行输出` : ""}</span></div>
-      ${hasDetail ? `<div class="Sxvs8a_root" ${expanded ? "" : "hidden"}><div class="Sxvs8a_body"><pre class="Y0dWHa_payload">${esc(output)}</pre></div></div>` : ""}
+      ${hasDetail ? `<div class="Sxvs8a_root" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg) : ""}</div>` : ""}
     </div></div></div>`;
   }
   return "";
 }
 
-function renderBlock(block, msg, idx) {
+function renderBlock(block, msg, idx, messageIndex) {
   if (block.type === "thinking") {
     const summary = (block.thinking || "").replace(/\s+/g, " ").slice(0, 160);
+    const thinkingKey = `${S.currentSessionId}:${messageIndex}:${idx}`;
+    const expanded = S.expandedThinking.has(thinkingKey);
     return `<div class="Md3f7G_flowItem" data-chat-flow-kind="assistant-step">
       <div class="Sxvs8a_root"><div class="Sxvs8a_body">
         <div class="QWLzlG_root" data-variant="think" data-state="ok">
-          <div class="_root_9cl6j_3"><div class="_row_9cl6j_10 QWLzlG_row" role="button" aria-expanded="false" data-action="toggle-thinking">
+          <div class="_root_9cl6j_3"><div class="_row_9cl6j_10 QWLzlG_row" role="button" aria-expanded="${expanded}" data-action="toggle-thinking" data-thinking-key="${esc(thinkingKey)}">
             <span class="_leading_9cl6j_23 QWLzlG_leading"><span class="_iconIdle_9cl6j_42">${ICONS.think}</span></span>
             <span class="_title_9cl6j_64 QWLzlG_title">Think</span><span class="QWLzlG_separator"></span>
             <span class="QWLzlG_summary">${esc(summary)}</span>
-          </div><div class="QWLzlG_detail" hidden><div class="Y0dWHa_thinkingQuote"><pre class="Y0dWHa_payload">${esc(block.thinking || "")}</pre></div></div></div>
+          </div><div class="QWLzlG_detail" data-block-index="${idx}" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg, idx) : ""}</div></div>
         </div>
       </div></div>
     </div>`;
@@ -1481,10 +1760,7 @@ function renderBlock(block, msg, idx) {
           <span class="CY-8Ka_title">${esc(block.name || "Tool")}</span><span class="CY-8Ka_sep"></span>
           <span class="CY-8Ka_summary ${result?.isError ? "CY-8Ka_errorSummary" : ""}">${esc(summary)}</span>
         </div>
-        ${hasDetail ? `<div class="Sxvs8a_root" ${expanded ? "" : "hidden"}><div class="Sxvs8a_body">
-          ${argsText ? `<pre class="Y0dWHa_payload">${esc(argsText)}</pre>` : ""}
-          ${resultText ? `<pre class="Y0dWHa_payload ${result?.isError ? "Y0dWHa_payloadError" : ""}">${esc(resultText)}</pre>` : ""}
-        </div></div>` : ""}
+        ${hasDetail ? `<div class="Sxvs8a_root" data-block-index="${idx}" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg, idx) : ""}</div>` : ""}
         </div>
       </div>
     </div>`;
@@ -1495,219 +1771,6 @@ function renderBlock(block, msg, idx) {
     </div>`;
   }
   return "";
-}
-
-function splitMarkdownTableRow(line) {
-  const text = String(line ?? "").trim();
-  const cells = [];
-  let cell = "";
-  let codeFence = 0;
-  let separators = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    const char = text[i];
-    if (char === "\\" && text[i + 1] === "|") {
-      cell += "|";
-      i += 1;
-      continue;
-    }
-    if (char === "`") {
-      let count = 1;
-      while (text[i + count] === "`") count += 1;
-      codeFence = codeFence === 0 ? count : codeFence === count ? 0 : codeFence;
-      cell += "`".repeat(count);
-      i += count - 1;
-      continue;
-    }
-    if (char === "|" && codeFence === 0) {
-      cells.push(cell.trim());
-      cell = "";
-      separators += 1;
-      continue;
-    }
-    cell += char;
-  }
-  cells.push(cell.trim());
-  if (cells.length > 1 && cells[0] === "") cells.shift();
-  if (cells.length > 1 && cells[cells.length - 1] === "") cells.pop();
-  return { cells, separators };
-}
-
-function markdownTableStart(lines, index) {
-  if (index + 1 >= lines.length) return null;
-  const header = splitMarkdownTableRow(lines[index]);
-  if (header.separators === 0 || header.cells.length === 0) return null;
-  const delimiter = splitMarkdownTableRow(lines[index + 1]);
-  if (delimiter.separators === 0 || delimiter.cells.length !== header.cells.length) return null;
-  if (!delimiter.cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
-  const alignments = delimiter.cells.map((cell) => {
-    const left = cell.startsWith(":");
-    const right = cell.endsWith(":");
-    if (left && right) return "center";
-    if (right) return "right";
-    if (left) return "left";
-    return "";
-  });
-  return { headers: header.cells, alignments };
-}
-
-function renderMarkdownTable(lines, index, table) {
-  const rows = [];
-  let nextIndex = index + 2;
-  while (nextIndex < lines.length && lines[nextIndex].trim() !== "") {
-    const parsed = splitMarkdownTableRow(lines[nextIndex]);
-    if (parsed.separators === 0) break;
-    const cells = parsed.cells.slice(0, table.headers.length);
-    while (cells.length < table.headers.length) cells.push("");
-    rows.push(cells);
-    nextIndex += 1;
-  }
-  const cellHtml = (tag, value, column) => {
-    const alignment = table.alignments[column];
-    const alignAttribute = alignment ? ` data-align="${alignment}"` : "";
-    return `<${tag}${alignAttribute}>${inlineMarkdown(value)}</${tag}>`;
-  };
-  const head = table.headers.map((cell, column) => cellHtml("th", cell, column)).join("");
-  const body = rows.map((row) => `<tr>${row.map((cell, column) => cellHtml("td", cell, column)).join("")}</tr>`).join("");
-  return {
-    html: `<div class="md-table-wrap"><table><thead><tr>${head}</tr></thead>${body ? `<tbody>${body}</tbody>` : ""}</table></div>`,
-    nextIndex,
-  };
-}
-
-function markdown(src) {
-  const lines = String(src ?? "").replace(/\r\n/g, "\n").split("\n");
-  let html = "";
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line.trim().startsWith("```")) {
-      const lang = line.trim().slice(3).trim();
-      const buf = [];
-      i += 1;
-      while (i < lines.length && !lines[i].trim().startsWith("```")) {
-        buf.push(lines[i]);
-        i += 1;
-      }
-      i += 1;
-      const code = buf.join("\n");
-      html += `<pre class="md-code-block"><code>${esc(code)}</code></pre>`;
-      continue;
-    }
-    const table = markdownTableStart(lines, i);
-    if (table) {
-      const rendered = renderMarkdownTable(lines, i, table);
-      html += rendered.html;
-      i = rendered.nextIndex;
-      continue;
-    }
-    if (/^#{1,6}\s+/.test(line)) {
-      const m = line.match(/^(#{1,6})\s+(.*)$/);
-      const level = m[1].length;
-      html += `<h${level}>${inlineMarkdown(m[2])}</h${level}>`;
-      i += 1;
-      continue;
-    }
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-        items.push(`<li>${inlineMarkdown(lines[i].replace(/^\s*[-*]\s+/, ""))}</li>`);
-        i += 1;
-      }
-      html += `<ul>${items.join("")}</ul>`;
-      continue;
-    }
-    if (/^\s*\d+[.)]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
-        items.push(`<li>${inlineMarkdown(lines[i].replace(/^\s*\d+[.)]\s+/, ""))}</li>`);
-        i += 1;
-      }
-      html += `<ol>${items.join("")}</ol>`;
-      continue;
-    }
-    if (/^\s*(---|\*\*\*)\s*$/.test(line)) {
-      html += "<hr/>";
-      i += 1;
-      continue;
-    }
-    if (/^&gt;\s?/.test(line) || /^>\s?/.test(line)) {
-      const buf = [];
-      while (i < lines.length && (/^>\s?/.test(lines[i]) || /^&gt;\s?/.test(lines[i]))) {
-        buf.push(lines[i].replace(/^(&gt;|>)\s?/, ""));
-        i += 1;
-      }
-      html += `<blockquote>${inlineMarkdown(buf.join("\n"))}</blockquote>`;
-      continue;
-    }
-    if (line.trim() === "") {
-      i += 1;
-      continue;
-    }
-    const para = [];
-    while (
-      i < lines.length
-      && lines[i].trim() !== ""
-      && !/^(#{1,6}\s+|```|\s*[-*]\s+|\s*\d+[.)]\s+|\s*(---|\*\*\*)\s*$|>\s?)/.test(lines[i])
-      && !markdownTableStart(lines, i)
-    ) {
-      para.push(lines[i]);
-      i += 1;
-    }
-    html += `<p>${inlineMarkdown(para.join("\n"))}</p>`;
-  }
-  return html;
-}
-
-function localFileLink(target) {
-  let value = String(target ?? "").trim();
-  let line = null;
-  const fragment = /#L(\d+)(?:C\d+)?$/i.exec(value);
-  if (fragment) {
-    line = Number(fragment[1]);
-    value = value.slice(0, fragment.index);
-  } else {
-    const location = /:(\d+)(?::\d+)?$/.exec(value);
-    if (location) {
-      line = Number(location[1]);
-      value = value.slice(0, location.index);
-    }
-  }
-  if (/^file:\/\/\//i.test(value)) {
-    try {
-      value = decodeURIComponent(new URL(value).pathname).replace(/^\/([A-Za-z]:[\\/])/, "$1");
-    } catch {
-      return null;
-    }
-  }
-  if (!/^[A-Za-z]:[\\/]/.test(value) && !/^\\\\[^\\]+\\[^\\]+/.test(value)) return null;
-  const href = `/api/fs/view?path=${encodeURIComponent(value)}${line ? `#L${line}` : ""}`;
-  return { path: value, line, href };
-}
-
-function inlineMarkdown(src) {
-  const links = [];
-  const withLinkTokens = String(src ?? "").replace(
-    /\[([^\]\n]+)\]\((<[^>\n]+>|[^)\s]+)\)/g,
-    (match, label, wrappedTarget) => {
-      const target = wrappedTarget.startsWith("<") ? wrappedTarget.slice(1, -1) : wrappedTarget;
-      const local = localFileLink(target);
-      if (local) {
-        const location = `${local.path}${local.line ? `:${local.line}` : ""}`;
-        links.push(`<a class="md-local-file" href="${esc(local.href)}" data-file-path="${esc(local.path)}" data-file-line="${local.line || ""}" title="${esc(location)}">${esc(label)}</a>`);
-      } else if (/^https?:\/\//i.test(target)) {
-        links.push(`<a href="${esc(target)}" target="_blank" rel="noreferrer">${esc(label)}</a>`);
-      } else {
-        return match;
-      }
-      return `\u0001${links.length - 1}\u0002`;
-    },
-  );
-  return esc(withLinkTokens)
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/\u0001(\d+)\u0002/g, (_, index) => links[Number(index)] || "")
-    .replace(/\n/g, "<br/>");
 }
 
 function renderWorkspaceMenu() {
@@ -2292,24 +2355,32 @@ const networkSettings = { data: null, form: null, dirty: false, saving: false, l
 function networkForm() {
   if (networkSettings.form) return networkSettings.form;
   const form = el(`<form id="webNetworkForm" class="pi-networkForm">
-    <label>访问方式<select name="mode" class="pi-passwordInput"><option value="local">仅本机</option><option value="lan">局域网</option><option value="relay">服务器中转</option></select></label>
+    <div class="pi-settingsCard">
+      <label class="pi-networkMode">访问方式<select name="mode" class="pi-passwordInput" aria-describedby="pi-network-hint"><option value="local">仅本机</option><option value="lan">局域网</option><option value="relay">服务器中转</option></select></label>
+      <p id="pi-network-hint" class="pi-networkHint">仅在这台电脑上访问。</p>
+    </div>
     <div class="pi-networkRelay" hidden>
-      <label>服务器地址<input name="serverAddr" class="pi-passwordInput" placeholder="服务器 IP 或域名" autocomplete="off"></label>
-      <label>frps 端口<input name="serverPort" class="pi-passwordInput" type="number" min="1" max="65535" value="7000"></label>
-      <label>认证密钥<input name="token" class="pi-passwordInput" type="password" autocomplete="new-password" placeholder="输入认证密钥"></label>
-      <label>HTTPS 手机入口<input name="origin" class="pi-passwordInput" type="url" placeholder="https://pi.example.com" autocomplete="off"></label>
-      <label>frpc 原生路径<input name="frpcPath" class="pi-passwordInput" placeholder="frpc" autocomplete="off"></label>
-      <p>首次使用请<a href="https://github.com/fatedier/frp/releases" target="_blank" rel="noopener noreferrer">下载原生 frpc</a>。路径为空时使用 PATH 中的 frpc，扩展会托管该进程。</p>
-      <details><summary>高级设置</summary><div class="pi-networkAdvanced">
+      <fieldset class="pi-settingsCard pi-networkFields"><legend>中转服务器</legend>
+        <div class="pi-networkPair">
+          <label>服务器地址<input name="serverAddr" class="pi-passwordInput" placeholder="服务器 IP 或域名" autocomplete="off"></label>
+          <label>frps 端口<input name="serverPort" class="pi-passwordInput" type="number" min="1" max="65535" value="7000"></label>
+        </div>
+        <label>认证密钥<input name="token" class="pi-passwordInput" type="password" autocomplete="new-password" placeholder="输入认证密钥"></label>
+        <label>HTTPS 访问地址<input name="origin" class="pi-passwordInput" type="url" placeholder="https://pi.example.com" autocomplete="off"></label>
+      </fieldset>
+      <fieldset class="pi-settingsCard pi-networkFields"><legend>本机客户端</legend>
+        <label>frpc 路径<input name="frpcPath" class="pi-passwordInput" placeholder="frpc" autocomplete="off"></label>
+        <p>留空使用 PATH 中的 frpc，由 Pi 自动启动。<a href="https://github.com/fatedier/frp/releases" target="_blank" rel="noopener noreferrer">下载 frpc ${ICONS.down}</a></p>
+      </fieldset>
+      <details class="pi-settingsCard pi-networkDetails"><summary>高级设置<span>隧道与端口</span></summary><div class="pi-networkAdvanced">
         <label>隧道名<input name="proxyName" class="pi-passwordInput" autocomplete="off" placeholder="使用默认名称"></label>
         <label>服务器内部端口<input name="visitorPort" class="pi-passwordInput" type="number" min="1" max="65535" value="13000"></label>
       </div></details>
     </div>
-    <p class="pi-networkHint">选择模式后保存生效。</p>
-    <button type="submit" class="pi-settingsAction pi-settingsActionPrimary">保存设置</button>
+    <div class="pi-networkFooter"><span class="pi-networkSaveHint">保存后生效</span><button type="submit" class="pi-settingsAction pi-settingsActionPrimary">保存设置</button></div>
     <div class="pi-networkStatus pi-settingsStatus" role="status"></div>
-    <div class="pi-networkUrls"></div>
-    <div class="pi-networkDownloads" hidden><p>下载已保存的服务器配置，证书路径请按服务器修改。</p><div class="pi-networkDownloadButtons">${["frps.toml", "visitor.toml", "nginx.conf"].map((name) => `<button type="button" class="pi-settingsAction" data-network-file="${name}">下载 ${name}</button>`).join("")}</div></div>
+    <section class="pi-networkAddresses" hidden><h4>访问链接</h4><div class="pi-networkUrls"></div></section>
+    <div class="pi-networkDownloads pi-settingsCard" hidden><h4>服务器配置</h4><p>下载已保存的配置，证书路径请按服务器修改。</p><div class="pi-networkDownloadButtons">${["frps.toml", "visitor.toml", "nginx.conf"].map((name) => `<button type="button" class="pi-settingsAction" data-network-file="${name}">${ICONS.down}${name}</button>`).join("")}</div></div>
   </form>`);
   networkSettings.form = form;
   form.oninput = form.onchange = () => {
@@ -2352,8 +2423,11 @@ function updateNetworkForm(sync = false) {
     const values = { mode: settings.mode, serverAddr: relay.serverAddr || "", serverPort: relay.serverPort || 7000, token: "", origin: relay.origin || "", frpcPath: relay.frpcPath || "", proxyName: relay.proxyName || "", visitorPort: relay.visitorPort || 13000 };
     for (const [name, value] of Object.entries(values)) form.elements.namedItem(name).value = value;
   }
-  const relayMode = form.elements.namedItem("mode").value === "relay";
+  const mode = form.elements.namedItem("mode").value;
+  const relayMode = mode === "relay";
   $(".pi-networkRelay", form).hidden = !relayMode;
+  $(".pi-networkHint", form).textContent = { local: "仅在这台电脑上访问。", lan: "让同一 Wi-Fi 或局域网内的设备访问。", relay: "通过自己的服务器，在外网访问 Pi。" }[mode];
+  $(".pi-networkSaveHint", form).textContent = state.dirty ? "有未保存的更改" : "保存后生效";
   form.querySelectorAll("input[name],select[name]").forEach((input) => {
     input.disabled = state.saving || !state.data || (input.tagName === "INPUT" && !relayMode);
   });
@@ -2372,6 +2446,7 @@ function updateNetworkForm(sync = false) {
     urls.dataset.urls = urlsKey;
     urls.innerHTML = (state.data?.urls || []).map((url) => `<div class="pi-settingsActionRow"><input class="pi-lanUrl" aria-label="手机访问链接" readonly value="${esc(url)}"><button type="button" class="pi-settingsAction" data-action="copy-text" data-text="${esc(url)}">复制链接</button></div>`).join("");
   }
+  $(".pi-networkAddresses", form).hidden = !state.data?.urls?.length;
   $(".pi-networkDownloads", form).hidden = state.data?.settings.mode !== "relay";
 }
 
@@ -2429,49 +2504,262 @@ async function saveNetworkSettings(event) {
   }
 }
 
+const terminalProxySettings = { data: null, form: null, dirty: false, saving: false, error: "", message: "", request: 0 };
+
+function terminalProxyForm() {
+  if (terminalProxySettings.form) return terminalProxySettings.form;
+  const form = el(`<form id="webTerminalProxyForm" class="pi-networkForm">
+    <div class="pi-settingsCard">
+      <label class="pi-networkMode">代理方式<select name="mode" class="pi-passwordInput"><option value="inherit">跟随启动环境</option><option value="manual">手动代理</option><option value="direct">直连</option></select></label>
+      <p class="pi-networkHint pi-proxyModeHint"></p>
+    </div>
+    <fieldset class="pi-settingsCard pi-networkFields pi-proxyFields" hidden><legend>代理地址</legend>
+      <label>HTTP / HTTPS 代理<input name="url" class="pi-passwordInput" type="url" maxlength="2048" placeholder="http://127.0.0.1:7987" autocomplete="off"></label>
+      <div class="pi-networkDownloadButtons"><button type="button" class="pi-settingsAction" data-proxy-port="7987">127.0.0.1:7987</button><button type="button" class="pi-settingsAction" data-proxy-port="10808">127.0.0.1:10808</button></div>
+      <p>请先开启 VPN，填写其 HTTP 或混合端口。仅提供 SOCKS 的端口无法用于此设置。</p>
+    </fieldset>
+    <p>用于 Pi Web 启动的 Pi 会话及其终端命令。保存后对新启动的会话进程生效；已有会话请在“维护”中重新加载运行时。此设置不会修改 Windows 全局代理。</p>
+    <div class="pi-networkFooter"><span class="pi-networkSaveHint"></span><button type="submit" class="pi-settingsAction pi-settingsActionPrimary">保存代理</button></div>
+    <div class="pi-proxyStatus pi-settingsStatus" role="status"></div>
+  </form>`);
+  terminalProxySettings.form = form;
+  form.oninput = form.onchange = () => {
+    terminalProxySettings.dirty = true;
+    terminalProxySettings.message = "";
+    updateTerminalProxyForm();
+  };
+  form.querySelectorAll("[data-proxy-port]").forEach((button) => {
+    button.onclick = () => {
+      form.elements.namedItem("url").value = `http://127.0.0.1:${button.dataset.proxyPort}`;
+      terminalProxySettings.dirty = true;
+      terminalProxySettings.message = "";
+      updateTerminalProxyForm();
+    };
+  });
+  form.onsubmit = saveTerminalProxySettings;
+  return form;
+}
+
+function updateTerminalProxyForm(sync = false) {
+  if (!S.localClient) return;
+  const state = terminalProxySettings;
+  const form = terminalProxyForm();
+  if (sync && state.data && !state.dirty && !state.saving) {
+    for (const [name, value] of Object.entries(state.data.settings)) form.elements.namedItem(name).value = value;
+  }
+  const manual = form.elements.namedItem("mode").value === "manual";
+  $(".pi-proxyFields", form).hidden = !manual;
+  $(".pi-proxyModeHint", form).textContent = {
+    inherit: "沿用启动 Pi 时的代理环境变量。", manual: "通过指定代理访问模型服务，本机地址保持直连。", direct: "清除会话的代理环境变量，直接连接模型服务。",
+  }[form.elements.namedItem("mode").value];
+  form.querySelectorAll("input,select,button").forEach((input) => { input.disabled = state.saving || !state.data; });
+  form.elements.namedItem("url").disabled = state.saving || !state.data || !manual;
+  form.elements.namedItem("url").required = manual;
+  $('button[type="submit"]', form).textContent = state.saving ? "保存中…" : "保存代理";
+  $(".pi-networkSaveHint", form).textContent = state.dirty ? "有未保存的更改" : "新启动的会话进程生效";
+  const status = $(".pi-proxyStatus", form);
+  status.textContent = state.error || state.message || (!state.data ? "正在加载终端代理…" : "");
+  status.classList.toggle("pi-settingsStatus-error", Boolean(state.error));
+}
+
+async function loadTerminalProxySettings() {
+  if (!S.localClient || terminalProxySettings.saving) return;
+  const state = terminalProxySettings;
+  const request = ++state.request;
+  updateTerminalProxyForm();
+  try {
+    const data = await api("/api/terminal-proxy");
+    if (request !== state.request) return;
+    state.data = data;
+    state.error = "";
+    updateTerminalProxyForm(true);
+  } catch (error) {
+    if (request !== state.request) return;
+    state.error = error.status === 404 ? "重新加载运行时以启用终端代理设置。" : `加载失败：${error.message || String(error)}。重新打开设置可重试。`;
+    updateTerminalProxyForm();
+  }
+}
+
+async function saveTerminalProxySettings(event) {
+  event.preventDefault();
+  const state = terminalProxySettings;
+  if (!S.localClient || state.saving || !state.data) return;
+  const form = event.currentTarget;
+  const body = { mode: form.elements.namedItem("mode").value, url: form.elements.namedItem("url").value.trim() };
+  ++state.request;
+  state.saving = true;
+  state.error = state.message = "";
+  updateTerminalProxyForm();
+  try {
+    state.data = await post("/api/terminal-proxy", body);
+    state.dirty = false;
+    state.message = "已保存。已有会话请在“维护”中重新加载运行时后使用新代理。";
+  } catch (error) {
+    state.error = `保存失败：${error.message || String(error)}`;
+  } finally {
+    state.saving = false;
+    updateTerminalProxyForm(!state.dirty);
+  }
+}
+
+const extensionSettingsState = { data: null, busy: false, message: "", error: false };
+
+function renderExtensionSettings() {
+  const mount = $("#webExtensionsMount");
+  if (!mount) return;
+  const state = extensionSettingsState;
+  const disabled = state.busy || Boolean(S.maintenanceBusy);
+  mount.innerHTML = `<div class="pi-settingsActionRow"><div class="pi-settingsActionCopy"><strong>已配置的扩展包</strong><p>显示全局与启动项目的包配置。包中可能同时包含技能、提示词和主题。</p></div><button type="button" class="pi-settingsAction" data-extension-refresh ${disabled ? "disabled" : ""}>${state.busy ? "处理中…" : "刷新列表"}</button></div>
+    ${state.data ? `<p class="pi-settingsFootnote">启动项目：${esc(state.data.cwd)}</p>` : ""}
+    <div class="pi-settingsCard pi-extensionList">${(state.data?.packages || []).map((item, index) => `<div class="pi-settingsActionRow"><div class="pi-settingsActionCopy"><strong>${esc(item.source)}</strong><p>${item.scope === "global" ? "全局" : "启动项目"} · ${item.enabled ? item.filtered ? "已启用（按过滤规则）" : "已启用" : "已停用"}</p></div><button type="button" class="pi-settingsAction" data-extension-index="${index}" aria-label="${esc((item.enabled ? "停用 " : "启用 ") + item.source)}" ${disabled ? "disabled" : ""}>${item.enabled ? "停用" : "启用"}</button></div>`).join("") || `<p class="pi-settingsFootnote">${state.busy ? "正在读取扩展配置…" : state.data ? "暂无扩展包配置。" : "尚未读取扩展配置。"}</p>`}</div>
+    <p class="pi-settingsFootnote">开关仅影响包内扩展，保留其他资源与原有过滤规则。项目配置可能覆盖全局配置。此列表不包含自动发现的本地扩展或命令行临时扩展。</p>
+    <div class="pi-settingsActionRow"><div class="pi-settingsActionCopy"><strong>应用配置</strong><p>已有会话进程请在空闲后重载。停用 Pi Web 所在包会关闭网页服务。</p></div><button type="button" class="pi-settingsAction" data-action="maintenance-reload" ${disabled ? "disabled" : ""}>重新加载</button></div>
+    ${state.message ? `<p class="pi-settingsStatus pi-settingsStatus-${state.error ? "error" : "info"}" role="status">${esc(state.message)}</p>` : ""}`;
+  $("[data-extension-refresh]", mount).onclick = () => void loadExtensionSettings();
+  $$("[data-extension-index]", mount).forEach((button) => {
+    button.onclick = () => {
+      const item = state.data.packages[Number(button.dataset.extensionIndex)];
+      void loadExtensionSettings({ scope: item.scope, source: item.source, enabled: !item.enabled });
+    };
+  });
+}
+
+async function loadExtensionSettings(change) {
+  const state = extensionSettingsState;
+  if (state.busy) return;
+  state.busy = true;
+  state.message = "";
+  state.error = false;
+  renderExtensionSettings();
+  try {
+    state.data = change ? await post("/api/extensions", change) : await api("/api/extensions");
+    if (change) state.message = "已保存，重新加载运行时后生效。";
+  } catch (error) {
+    state.message = error.message || String(error);
+    state.error = true;
+  } finally {
+    state.busy = false;
+    renderExtensionSettings();
+  }
+}
+
+let settingsReturnFocus = null;
+const SETTINGS_TABS = [
+  { id: "appearance", label: "外观", icon: "appearance", title: "外观与主题", description: "选择适合你的主题，专注于眼前的对话。" },
+  { id: "network", label: "连接", icon: "network", title: "设备连接", description: "管理这台电脑的访问方式与连接地址。" },
+  { id: "proxy", label: "代理", icon: "network", title: "终端代理", description: "为 Pi 调用模型及终端命令配置网络代理。" },
+  { id: "security", label: "安全", icon: "shield", title: "访问安全", description: "使用固定密码，保护其他设备对 Pi 的访问。" },
+  { id: "extensions", label: "扩展", icon: "gear", title: "Pi 扩展", description: "管理扩展包的加载配置，保存后重新加载运行时生效。" },
+  { id: "maintenance", label: "维护", icon: "refresh", title: "更新与维护", description: "更新已安装的扩展，或重新加载运行时。" },
+];
+
+function selectSettingsTab(id, focus = false) {
+  if (!SETTINGS_TABS.some((tab) => tab.id === id)) return;
+  S.settingsTab = id;
+  const overlay = $("#overlayMount");
+  $(".pi-settingsNav", overlay).setAttribute("aria-orientation", matchMedia("(max-width: 640px)").matches ? "horizontal" : "vertical");
+  $$("[data-settings-tab]", overlay).forEach((button) => {
+    const selected = button.dataset.settingsTab === id;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    if (selected && focus) button.focus();
+  });
+  $$("[data-settings-page]", overlay).forEach((page) => { page.hidden = page.dataset.settingsPage !== id; });
+  $(".pi-settingsContent", overlay).scrollTop = 0;
+  if (id === "extensions" && S.localClient) void loadExtensionSettings();
+}
+
 function renderSettings() {
   const busy = Boolean(S.maintenanceBusy);
-  const themes = [
-    ["system", "跟随系统"],
-    ["light", "浅色"],
-    ["dark", "深色"],
-  ];
+  const themes = [["light", "浅色"], ["dark", "深色"], ["system", "跟随系统"]];
+  const styles = [["classic", "经典", "简洁 · 专注"], ["sakura", "樱花来信", "樱粉 · 春日"], ["starlight", "星夜列车", "星蓝 · 微光"]];
+  const active = S.settingsTab || "appearance";
+  const pageStart = (id) => {
+    const tab = SETTINGS_TABS.find((item) => item.id === id);
+    return `<section id="pi-settings-page-${id}" class="pi-settingsSection" role="tabpanel" aria-labelledby="pi-settings-tab-${id}" tabindex="0" data-settings-page="${id}" ${active === id ? "" : "hidden"}>
+      <div class="pi-settingsPageHeading"><h3>${tab.title}</h3><p>${tab.description}</p></div>`;
+  };
   const status = S.maintenanceMessage
     ? `<div class="pi-settingsStatus pi-settingsStatus-${esc(S.maintenanceMessage.type || "info")}" role="status">${esc(S.maintenanceMessage.text || "")}</div>`
     : "";
   return `<div class="pi-settingsBackdrop">
     <div class="pi-settingsPanel" role="dialog" aria-modal="true" aria-labelledby="pi-settings-title">
       <header class="pi-settingsHeader">
-        <h2 id="pi-settings-title">设置</h2>
-        <button type="button" class="pi-settingsClose" data-action="settings-close" aria-label="关闭设置" title="关闭" ${busy ? "disabled" : ""}>×</button>
+        <div><span class="pi-settingsBrand" aria-hidden="true">${ICONS.gear}</span><h2 id="pi-settings-title">设置</h2></div>
+        <button type="button" class="pi-settingsClose" data-action="settings-close" aria-label="关闭设置" title="关闭" ${busy ? "disabled" : ""}>${ICONS.close}</button>
       </header>
-      <section class="pi-settingsSection" aria-labelledby="pi-settings-appearance">
-        <h3 id="pi-settings-appearance">外观</h3>
-        <div class="pi-settingsTheme" role="group" aria-label="界面主题">
-          ${themes.map(([value, label]) => `<button type="button" data-action="choose-theme" data-theme="${value}" aria-pressed="${S.theme === value}" ${busy ? "disabled" : ""}>${label}</button>`).join("")}
+      <div class="pi-settingsBody">
+        <aside class="pi-settingsSidebar">
+          <div class="pi-settingsNav" role="tablist" aria-label="设置分类" aria-orientation="${matchMedia("(max-width: 640px)").matches ? "horizontal" : "vertical"}">
+            ${SETTINGS_TABS.map((tab) => `<button type="button" id="pi-settings-tab-${tab.id}" role="tab" aria-selected="${active === tab.id}" aria-controls="pi-settings-page-${tab.id}" tabindex="${active === tab.id ? 0 : -1}" data-action="settings-tab" data-settings-tab="${tab.id}"><span aria-hidden="true">${ICONS[tab.icon]}</span>${tab.label}<span class="pi-settingsNavMarker" aria-hidden="true"></span></button>`).join("")}
+          </div>
+          <div class="pi-settingsSidebarNote">Pi Web<span>${S.localClient ? "本机设置" : "远程连接"}</span></div>
+        </aside>
+        <div class="pi-settingsContent">
+          ${pageStart("appearance")}
+            <div class="pi-settingsGroupHeading"><h4>主题风格</h4><span>即时生效</span></div>
+            <div class="pi-settingsTheme pi-settingsStyles" role="group" aria-label="主题风格">
+              ${styles.map(([value, label, description]) => `<button type="button" data-action="choose-theme-style" data-theme-style="${value}" aria-pressed="${(S.themeStyle || "classic") === value}" ${busy ? "disabled" : ""}>
+                <span class="pi-stylePreview pi-stylePreview-${value}" aria-hidden="true"><span class="pi-stylePreviewWindow"><i></i><i></i><i></i></span></span>
+                <span class="pi-themeLabel">${label}<span class="pi-themeCheck" aria-hidden="true">${(S.themeStyle || "classic") === value ? ICONS.check : ""}</span></span>
+                <span class="pi-styleDescription">${description}</span>
+              </button>`).join("")}
+            </div>
+            <div class="pi-settingsGroupHeading pi-themeModeHeading"><h4>明暗模式</h4></div>
+            <div class="pi-settingsTheme" role="group" aria-label="明暗模式">
+              ${themes.map(([value, label]) => `<button type="button" data-action="choose-theme" data-theme="${value}" aria-pressed="${S.theme === value}" ${busy ? "disabled" : ""}>
+                <span class="pi-themePreview pi-themePreview-${value}" aria-hidden="true"><span class="pi-themePreviewSidebar"><i></i><i></i><i></i></span><span class="pi-themePreviewChat"><i></i><i></i><i></i><span></span></span></span>
+                <span class="pi-themeLabel">${label}<span class="pi-themeCheck" aria-hidden="true">${S.theme === value ? ICONS.check : ""}</span></span>
+              </button>`).join("")}
+            </div>
+            <p class="pi-settingsFootnote">跟随系统会随设备的深浅色模式自动切换。</p>
+            <div class="pi-settingsGroupHeading pi-themeModeHeading"><h4>聊天背景</h4><span>当前浏览器</span></div>
+            <div class="pi-backgroundCard">
+              <div class="pi-backgroundPreview" aria-hidden="true">${S.backgroundUrl ? `<img src="${esc(S.backgroundUrl)}" alt="">` : ""}</div>
+              <div class="pi-backgroundCopy"><strong>${esc(S.backgroundName || "使用主题默认背景")}</strong><p>PNG、JPEG 或 WebP，最大 10 MB。图片仅保存在当前浏览器，刷新后保留。</p></div>
+              <div class="pi-backgroundActions">
+                <input id="backgroundFile" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+                <button type="button" class="pi-settingsAction" data-action="choose-background" ${busy || S.backgroundBusy ? "disabled" : ""}>${S.backgroundBusy ? "处理中…" : S.backgroundUrl ? "更换图片" : "上传图片"}</button>
+                <button type="button" class="pi-settingsAction" data-action="reset-background" ${busy || S.backgroundBusy || !S.backgroundUrl ? "disabled" : ""}>恢复默认</button>
+              </div>
+              ${S.backgroundError ? `<p class="pi-backgroundError" role="alert">${esc(S.backgroundError)}</p>` : ""}
+            </div>
+          </section>
+          ${pageStart("network")}
+            ${S.localClient ? '<div id="webNetworkMount"></div>' : '<div class="pi-settingsCard pi-settingsEmpty"><span class="pi-settingsEmptyIcon" aria-hidden="true">' + ICONS.network + '</span><strong>已连接远程服务</strong><p>访问方式与中转配置可在运行 Pi 的电脑上管理。</p></div>'}
+          </section>
+          ${pageStart("proxy")}
+            ${S.localClient ? '<div id="webTerminalProxyMount"></div>' : '<div class="pi-settingsCard pi-settingsEmpty"><strong>在本机管理终端代理</strong><p>请在运行 Pi 的电脑上配置代理地址。</p></div>'}
+          </section>
+          ${pageStart("security")}
+            ${S.localClient ? `<div class="pi-settingsCard">
+              <div class="pi-settingsGroupHeading"><h4>访问密码</h4><span class="pi-settingsBadge">${S.passwordConfigured ? "已设置" : "未设置"}</span></div>
+              <form id="webPasswordForm" class="pi-passwordForm">
+                <label for="webPassword">${S.passwordConfigured ? "更换密码" : "设置密码"}</label>
+                <div class="pi-settingsActionRow"><input id="webPassword" class="pi-passwordInput" type="password" name="password" autocomplete="new-password" maxlength="256" required placeholder="${S.passwordConfigured ? "输入新密码" : "输入固定密码"}"><button type="submit" class="pi-settingsAction pi-settingsActionPrimary">保存密码</button></div>
+                <p class="pi-passwordStatus" role="status">${S.passwordConfigured ? "修改后，其他设备需要重新登录。" : "设置后，其他设备可用此密码登录。"}</p>
+              </form>
+            </div>` : `<div class="pi-settingsCard pi-settingsEmpty"><span class="pi-settingsEmptyIcon" aria-hidden="true">${ICONS.shield}</span><strong>在本机管理密码</strong><p>请在运行 Pi 的电脑上设置或更换访问密码。</p></div>`}
+          </section>
+          ${pageStart("extensions")}
+            ${S.localClient ? '<div id="webExtensionsMount"></div>' : '<div class="pi-settingsCard pi-settingsEmpty"><strong>在本机管理扩展</strong><p>请在运行 Pi 的电脑上修改扩展配置。</p></div>'}
+            ${status}
+          </section>
+          ${pageStart("maintenance")}
+            <div class="pi-settingsCard pi-settingsMaintenance">
+              <div class="pi-settingsActionRow">
+                <div class="pi-settingsActionCopy"><strong>更新扩展</strong><p>获取已安装扩展的最新版本并重载。</p></div>
+                <button type="button" class="pi-settingsAction" data-action="maintenance-update-reload" ${busy ? "disabled" : ""}>${S.maintenanceBusy === "update" ? '<span class="pi-settingsSpinner"></span>更新中' : `${ICONS.down}<span>更新并重载</span>`}</button>
+              </div>
+              <div class="pi-settingsActionRow">
+                <div class="pi-settingsActionCopy"><strong>重新加载运行时</strong><p>应用本地的扩展与配置变更。</p></div>
+                <button type="button" class="pi-settingsAction" data-action="maintenance-reload" ${busy ? "disabled" : ""}>${S.maintenanceBusy === "reload" ? '<span class="pi-settingsSpinner"></span>重载中' : `${ICONS.refresh}<span>重新加载</span>`}</button>
+              </div>
+            </div>
+            ${status}
+          </section>
         </div>
-      </section>
-      <section class="pi-settingsSection" aria-labelledby="pi-settings-network">
-        <h3 id="pi-settings-network">手机访问</h3>
-        ${S.localClient ? '<div id="webNetworkMount"></div>' : '<p>已连接远程服务</p>'}
-        ${S.localClient ? `<form id="webPasswordForm" class="pi-passwordForm">
-          <label for="webPassword">${S.passwordConfigured ? "更换访问密码" : "设置访问密码"}</label>
-          <div class="pi-settingsActionRow"><input id="webPassword" class="pi-passwordInput" type="password" name="password" autocomplete="new-password" maxlength="256" required placeholder="${S.passwordConfigured ? "输入新密码" : "输入固定密码"}"><button type="submit" class="pi-settingsAction">保存密码</button></div>
-          <p class="pi-passwordStatus" role="status">${S.passwordConfigured ? "已设置密码，修改后手机需重新登录。" : "设置后，手机可用此密码登录。"}</p>
-        </form>` : ""}
-      </section>
-      <section class="pi-settingsSection" aria-labelledby="pi-settings-maintenance">
-        <h3 id="pi-settings-maintenance">Pi 维护</h3>
-        <div class="pi-settingsActionRow">
-          <div class="pi-settingsActionCopy"><strong>更新扩展并重载</strong><code>pi update --extensions</code></div>
-          <button type="button" class="pi-settingsAction pi-settingsActionPrimary" data-action="maintenance-update-reload" ${busy ? "disabled" : ""}>${S.maintenanceBusy === "update" ? '<span class="pi-settingsSpinner"></span>更新中' : `${ICONS.refresh}<span>更新并重载</span>`}</button>
-        </div>
-        <div class="pi-settingsActionRow">
-          <div class="pi-settingsActionCopy"><strong>重新加载运行时</strong><code>/reload</code></div>
-          <button type="button" class="pi-settingsAction" data-action="maintenance-reload" ${busy ? "disabled" : ""}>${S.maintenanceBusy === "reload" ? '<span class="pi-settingsSpinner"></span>重载中' : `${ICONS.refresh}<span>重新加载</span>`}</button>
-        </div>
-        ${status}
-      </section>
+      </div>
     </div>
   </div>`;
 }
@@ -2482,9 +2770,12 @@ function renderOverlay() {
   if (S.settingsOpen) {
     const passwordForm = $("#webPasswordForm", overlay);
     const focused = overlay.contains(document.activeElement) ? document.activeElement : null;
-    const scrollTop = $(".pi-settingsPanel", overlay)?.scrollTop || 0;
+    const wasOpen = Boolean($(".pi-settingsPanel", overlay));
+    if (!wasOpen) settingsReturnFocus = document.activeElement;
+    const scrollTop = $(".pi-settingsContent", overlay)?.scrollTop || 0;
     passwordForm?.remove();
     networkSettings.form?.remove();
+    terminalProxySettings.form?.remove();
     overlay.innerHTML = renderSettings();
     const nextForm = $("#webPasswordForm", overlay);
     if (passwordForm && nextForm) {
@@ -2493,6 +2784,12 @@ function renderOverlay() {
       $("#webPassword", passwordForm).placeholder = $("#webPassword", nextForm).placeholder;
       nextForm.replaceWith(passwordForm);
     }
+    const backgroundFile = $("#backgroundFile", overlay);
+    if (backgroundFile) backgroundFile.onchange = () => {
+      const file = backgroundFile.files[0];
+      backgroundFile.value = "";
+      if (file) void changeCustomBackground(file);
+    };
     const form = $("#webPasswordForm", overlay);
     if (form) form.onsubmit = saveWebPassword;
     const networkMount = $("#webNetworkMount", overlay);
@@ -2500,11 +2797,31 @@ function renderOverlay() {
       networkMount.replaceWith(networkForm());
       updateNetworkForm();
     }
-    if (focused?.isConnected) focused.focus({ preventScroll: true });
-    $(".pi-settingsPanel", overlay).scrollTop = scrollTop;
+    renderExtensionSettings();
+    if (S.settingsTab === "extensions" && S.localClient && !extensionSettingsState.data && !extensionSettingsState.busy) void loadExtensionSettings();
+    const proxyMount = $("#webTerminalProxyMount", overlay);
+    if (proxyMount) {
+      proxyMount.replaceWith(terminalProxyForm());
+      updateTerminalProxyForm();
+    }
+    const nextFocus = focused?.isConnected ? focused
+      : focused?.dataset.settingsTab ? $(`[data-settings-tab="${focused.dataset.settingsTab}"]`, overlay)
+      : focused?.dataset.theme ? $(`[data-theme="${focused.dataset.theme}"]`, overlay)
+      : focused?.dataset.themeStyle ? $(`[data-theme-style="${focused.dataset.themeStyle}"]`, overlay)
+      : focused?.dataset.action ? $(`[data-action="${focused.dataset.action}"]`, overlay) : null;
+    if (nextFocus) nextFocus.focus({ preventScroll: true });
+    else if (!wasOpen) $('[role="tab"][aria-selected="true"]', overlay)?.focus({ preventScroll: true });
+    $(".pi-settingsContent", overlay).scrollTop = scrollTop;
     return;
   }
+  const wasOpen = Boolean($(".pi-settingsPanel", overlay));
   overlay.innerHTML = "";
+  if (wasOpen) {
+    const trigger = [settingsReturnFocus, ...$$('[data-action="settings"], [data-action="open-mobile-sidebar"], #composerInput')]
+      .find((element) => element && element !== document.body && element.isConnected && !element.closest("[inert]") && element.getClientRects().length);
+    trigger?.focus({ preventScroll: true });
+    settingsReturnFocus = null;
+  }
 }
 
 async function saveWebPassword(event) {
@@ -2568,7 +2885,7 @@ function bindComposerInput() {
       if (!hasImage) return;
       event.preventDefault();
       if (S.localClient) void pasteSystemClipboard();
-      else void uploadImages([...(event.clipboardData?.items || [])].filter((item) => item.type.startsWith("image/")).map((item) => item.getAsFile()).filter(Boolean));
+      else void uploadFiles([...(event.clipboardData?.items || [])].filter((item) => item.type.startsWith("image/")).map((item) => item.getAsFile()).filter(Boolean));
     });
     input.addEventListener("keydown", (event) => {
       if (event.isComposing || event.keyCode === 229) return;
@@ -2673,6 +2990,14 @@ async function loadBootstrap() {
     messages: [],
     dialogs: [],
   };
+  if (!S.currentSessionId && S.currentWorkspaceId) {
+    try {
+      const defaults = await post(`/api/workspaces/${encodeURIComponent(S.currentWorkspaceId)}/models`, {});
+      S.newSessionSnapshot = { ...S.newSessionSnapshot, ...defaults };
+    } catch (error) {
+      console.error("[pi-web] loading new session defaults failed:", error);
+    }
+  }
   renderApp();
   if (S.currentSessionId) await openSession(S.currentSessionId, { silent: true });
 }
@@ -2684,8 +3009,8 @@ async function openSession(id, opts = {}) {
   ++S.historyGeneration;
   S.conversationTab = "conversation";
   S.historyView = null;
-  const generation = ++S.openGeneration;
   if (!opts.skipRemember) rememberCurrentDraft();
+  const generation = ++S.openGeneration;
   S.currentSessionId = id;
   S.loadingSession = id;
   if (!opts.silent) {
@@ -2703,7 +3028,7 @@ async function openSession(id, opts = {}) {
   renderSidebar();
   renderConversation();
   try {
-    const data = await post(`/api/sessions/${encodeURIComponent(id)}/open`);
+    const data = opts.initialSnapshot ?? await post(`/api/sessions/${encodeURIComponent(id)}/open`);
     S.snapshots.set(id, data);
     if (generation !== S.openGeneration) return;
     const ws = data.session?.workspaceId;
@@ -2719,28 +3044,74 @@ async function openSession(id, opts = {}) {
 }
 
 async function createAndOpenSession(workspaceId, title, options = {}) {
+  if (S.pendingCreation) return null;
+  const source = S.newSessionPreferenceWorkspaceId === workspaceId && !S.currentSessionId
+    ? S.newSessionSnapshot : null;
+  const previous = {
+    sessionId: S.currentSessionId, workspaceId: S.currentWorkspaceId,
+    conversationTab: S.conversationTab, historyView: S.historyView,
+    draft: S.draft, attachments: [...S.draftAttachments],
+  };
+  rememberCurrentDraft();
+  const generation = ++S.openGeneration;
+  const pending = { generation, workspaceId, draftKey: `creating:${generation}` };
+  S.pendingCreation = pending;
+  closeMobileSidebar();
+  closeCommandMenu();
+  ++S.historyGeneration;
+  S.conversationTab = "conversation";
+  S.historyView = null;
+  S.currentSessionId = null;
+  S.currentWorkspaceId = workspaceId;
+  S.loadingSession = null;
+  sessionStorage.removeItem("pi-web-current-session");
+  if (!options.keepDraft) {
+    S.draft = "";
+    S.draftAttachments = [];
+  }
+  renderSidebar();
+  renderConversation();
   try {
-    const source = currentSnapshot();
-    const model = source.state?.model;
+    const model = source?.state?.model;
     const data = await post(`/api/workspaces/${encodeURIComponent(workspaceId)}/sessions`, {
       title,
       model: model?.provider && model?.id ? { provider: model.provider, modelId: model.id } : undefined,
-      thinkingLevel: source.state?.thinkingLevel || undefined,
+      thinkingLevel: source?.state?.thinkingLevel || undefined,
     });
     const id = data.session?.id;
     if (!id) throw new Error("create session failed");
     S.snapshots.set(id, data);
-    if (!options.keepDraft) {
-      rememberCurrentDraft();
-      S.draft = "";
-      S.draftAttachments = [];
+    if (generation !== S.openGeneration) {
+      // Navigation owns the composer now; retain any pending draft with the created session.
+      const draft = S.drafts.get(pending.draftKey);
+      const attachments = S.attachmentDrafts.get(pending.draftKey);
+      if (draft) S.drafts.set(draftKey(id), draft);
+      if (attachments) S.attachmentDrafts.set(draftKey(id), attachments);
+      return null;
     }
-    S.currentWorkspaceId = workspaceId;
-    await openSession(id, { silent: true, skipRemember: !options.keepDraft });
-    return id;
+    S.newSessionPreferenceWorkspaceId = null;
+    await openSession(id, { silent: true, skipRemember: true, initialSnapshot: data });
+    return generation + 1 === S.openGeneration && S.currentSessionId === id ? id : null;
   } catch (error) {
-    alert(`新建会话失败：${error.message}`);
+    if (generation === S.openGeneration) {
+      S.pendingCreation = null;
+      S.currentSessionId = previous.sessionId;
+      S.currentWorkspaceId = previous.workspaceId;
+      S.loadingSession = null;
+      S.conversationTab = previous.conversationTab;
+      S.historyView = previous.historyView;
+      S.draftAttachments = previous.attachments;
+      setDraftValue(previous.draft);
+      if (previous.sessionId) sessionStorage.setItem("pi-web-current-session", previous.sessionId);
+      renderSidebar();
+      renderConversation();
+      alert(`新建会话失败：${error.message}`);
+    }
     return null;
+  } finally {
+    if (S.pendingCreation === pending) S.pendingCreation = null;
+    S.drafts.delete(pending.draftKey);
+    S.attachmentDrafts.delete(pending.draftKey);
   }
 }
 
@@ -3317,60 +3688,69 @@ function insertComposerText(text) {
 
 function setClipboardBusy(busy) {
   S.clipboardBusy = busy;
-  const button = $('[data-action="paste-image"]');
-  if (button) {
-    button.disabled = busy;
-    button.toggleAttribute("data-loading", busy);
-  }
+  queueRender(true, { conversation: true });
 }
 
-async function deleteImageAttachment(id) {
+async function deleteAttachment(id) {
   if (!id) return;
   await api(`/api/attachments/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {});
 }
 
-function readImageData(file) {
+function readFileData(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",")[1]);
-    reader.onerror = () => reject(new Error("无法读取图片"));
+    reader.onerror = () => reject(new Error(`无法读取文件：${file.name}`));
     reader.readAsDataURL(file);
   });
 }
 
-async function uploadImages(files) {
+async function uploadFiles(files) {
   if (S.clipboardBusy || !files.length) return;
-  if (!modelSupportsImages()) return showToast("当前模型不支持图片输入，请先切换视觉模型", "warning");
-  if (S.draftAttachments.length + files.length > 4) return showToast("每条消息最多附加 4 张图片", "warning");
-  if (files.some((file) => file.size > 15 * 1024 * 1024)) return showToast("图片不能超过 15 MB", "warning");
+  if (S.draftAttachments.length + files.length > 8) return showToast("每条消息最多附加 8 个文件", "warning");
   const key = draftKey();
   setClipboardBusy(true);
   try {
     for (const file of files) {
-      const data = await post("/api/attachments", { data: await readImageData(file) });
-      if (draftKey() !== key) {
-        await deleteImageAttachment(data.attachment?.id);
-        showToast("会话已切换，本次上传已取消", "warning");
-        break;
+      if (draftKey() !== key) break;
+      try {
+        if (file.size > 15 * 1024 * 1024) throw new Error("文件不能超过 15 MB");
+        const data = await post("/api/attachments", { name: file.name, data: await readFileData(file) });
+        if (draftKey() !== key) {
+          await deleteAttachment(data.attachment?.id);
+          showToast("会话已切换，本次上传已取消", "warning");
+          break;
+        }
+        if (isImageAttachment(data.attachment)) {
+          if (!modelSupportsImages() || S.draftAttachments.filter(isImageAttachment).length >= 4) {
+            await deleteAttachment(data.attachment.id);
+            throw new Error(modelSupportsImages() ? "每条消息最多附加 4 张图片" : "当前模型不支持图片输入，请先切换视觉模型");
+          }
+        }
+        setDraftAttachments([...S.draftAttachments, data.attachment]);
+        queueRender(true, { conversation: true });
+      } catch (error) {
+        showToast(`${file.name}：${error.message || String(error)}`, "error");
       }
-      setDraftAttachments([...S.draftAttachments, data.attachment]);
     }
-    queueRender(true, { conversation: true });
-  } catch (error) {
-    showToast(error.message || String(error), "error");
   } finally {
     setClipboardBusy(false);
   }
 }
 
+function selectAttachmentFiles(imagesOnly = false) {
+  if (S.clipboardBusy) return;
+  const picker = document.createElement("input");
+  picker.type = "file";
+  if (imagesOnly) picker.accept = "image/png,image/jpeg,image/gif,image/webp,image/bmp";
+  picker.multiple = true;
+  picker.addEventListener("change", () => { void uploadFiles([...picker.files]); });
+  picker.click();
+}
+
 async function pasteSystemClipboard() {
   if (!S.localClient) {
-    const picker = document.createElement("input");
-    picker.type = "file";
-    picker.accept = "image/png,image/jpeg,image/gif,image/webp,image/bmp";
-    picker.multiple = true;
-    picker.addEventListener("change", () => { void uploadImages([...picker.files]); });
-    picker.click();
+    selectAttachmentFiles(true);
     return;
   }
   if (S.clipboardBusy) return;
@@ -3378,16 +3758,16 @@ async function pasteSystemClipboard() {
     showToast("当前模型不支持图片输入，请先切换视觉模型", "warning");
     return;
   }
-  if (S.draftAttachments.length >= 4) {
-    showToast("每条消息最多附加 4 张图片", "warning");
+  if (S.draftAttachments.length >= 8 || S.draftAttachments.filter(isImageAttachment).length >= 4) {
+    showToast("每条消息最多附加 8 个文件，其中图片最多 4 张", "warning");
     return;
   }
-  const sessionId = S.currentSessionId;
+  const key = draftKey();
   setClipboardBusy(true);
   try {
     const data = await post("/api/clipboard/paste");
-    if (S.currentSessionId !== sessionId) {
-      if (data.kind === "image") await deleteImageAttachment(data.attachment?.id);
+    if (draftKey() !== key) {
+      if (data.kind === "image") await deleteAttachment(data.attachment?.id);
       showToast("会话已切换，本次粘贴已取消", "warning");
       return;
     }
@@ -3527,53 +3907,147 @@ function clearComposerDraft(options = {}) {
   }
 }
 
+async function selectModelFromCommand(reference) {
+  const sessionId = S.currentSessionId;
+  const workspaceId = S.currentWorkspaceId || currentWorkspace()?.id;
+  if (!sessionId && !workspaceId) throw new Error("请先打开工作区");
+  await refreshModelCatalog(sessionId, workspaceId, currentSnapshot());
+  const snap = snapshotFor(sessionId);
+  const matches = (snap.models || []).filter((model) =>
+    model.id.toLowerCase() === reference.toLowerCase()
+    || `${model.provider}/${model.id}`.toLowerCase() === reference.toLowerCase());
+  if (matches.length !== 1) {
+    if (S.currentSessionId !== sessionId) return;
+    await openModelSelector($('[data-action="model-menu"]'));
+    const input = $(".pi-modelSearchInput");
+    if (input) {
+      input.value = reference;
+      input.dispatchEvent(new Event("input"));
+    }
+    return;
+  }
+  const model = matches[0];
+  const thinkingLevels = snap.thinkingLevelsByModel?.[`${model.provider}/${model.id}`] || ["off"];
+  const thinkingLevel = thinkingLevels.includes(snap.state?.thinkingLevel) ? snap.state.thinkingLevel : thinkingLevels[0];
+  if (sessionId) await post(`/api/sessions/${encodeURIComponent(sessionId)}/set_model`, { provider: model.provider, modelId: model.id });
+  const next = { ...snapshotFor(sessionId), state: { ...(snapshotFor(sessionId).state || {}), model, thinkingLevel }, thinkingLevels };
+  if (sessionId) S.snapshots.set(sessionId, next);
+  else if (!S.currentSessionId && S.currentWorkspaceId === workspaceId) {
+    S.newSessionSnapshot = next;
+    S.newSessionPreferenceWorkspaceId = workspaceId;
+  }
+  queueRender(true);
+  showToast(`模型已切换为 ${model.provider}/${model.id}`);
+}
+
+async function selectThinkingFromCommand(value) {
+  const sessionId = S.currentSessionId;
+  const level = value.toLowerCase();
+  let snap = currentSnapshot();
+  if (sessionId) {
+    const data = await post(`/api/sessions/${encodeURIComponent(sessionId)}/refresh`);
+    snap = { ...snapshotFor(sessionId), ...data };
+    S.snapshots.set(sessionId, snap);
+  }
+  const levels = snap.thinkingLevels || [];
+  if (!levels.includes(level)) throw new Error(`当前模型不支持思考强度 ${value}，可选：${levels.join("、") || "无"}`);
+  if (sessionId) await post(`/api/sessions/${encodeURIComponent(sessionId)}/set_thinking_level`, { level });
+  const next = { ...snapshotFor(sessionId), state: { ...(snapshotFor(sessionId).state || {}), thinkingLevel: level } };
+  if (sessionId) S.snapshots.set(sessionId, next);
+  else {
+    S.newSessionSnapshot = next;
+    S.newSessionPreferenceWorkspaceId = S.currentWorkspaceId;
+  }
+  queueRender(true);
+  showToast(`思考强度已切换为 ${level}`);
+}
+
 async function executeLocalSlashCommand(text) {
-  const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text);
-  if (!match) return false;
-  const name = match[1];
-  const args = (match[2] || "").trim();
-  if (!WEB_SLASH_COMMANDS.some((command) => command.name === name) && name !== "thinking") return false;
+  const parsed = parseSlashCommand(text);
+  if (!parsed) return false;
+  const { name, args } = parsed;
+  if (Object.hasOwn(unsupportedSlashCommands, name)) throw new Error(unsupportedSlashCommands[name]);
+  const command = WEB_SLASH_COMMANDS.find((command) => command.name === name);
+  if (!command) return false;
+  if (args && !command.acceptsArgs) throw new Error(`/${name} 不接受参数${name === "export" ? "，Web 会将 HTML 文件下载到浏览器下载目录" : ""}`);
 
   const sessionId = S.currentSessionId;
-  clearComposerDraft();
-  if (name === "model") {
-    await openModelSelector($('[data-action="model-menu"]'));
+  if (["reload", "compact", "tree", "rewind", "name", "session", "export", "copy"].includes(name) && !sessionId) {
+    throw new Error("请先打开会话");
+  }
+  if (name === "reload") {
+    let result;
+    try {
+      result = await post(`/api/sessions/${encodeURIComponent(sessionId)}/reload`);
+    } catch (error) {
+      if (error.status === 404) throw new Error("当前 Web 服务尚未加载重载接口。请在设置 → 维护中重新加载，或在启动 Pi Web 的终端执行 /reload，然后刷新网页。");
+      throw error;
+    }
+    if (result?.reloaded !== true) throw new Error("服务端未确认重载完成，请重新加载 Pi Web 服务后再试。");
+    showToast("当前会话的扩展与配置已重新加载");
+  } else if (name === "model") {
+    if (args) await selectModelFromCommand(args);
+    else await openModelSelector($('[data-action="model-menu"]'));
   } else if (name === "thinking") {
-    await openThinkingSelector($('[data-action="thinking-menu"]'));
+    if (args) await selectThinkingFromCommand(args);
+    else await openThinkingSelector($('[data-action="thinking-menu"]'));
   } else if (name === "settings") {
     S.settingsOpen = true;
     closePopovers();
     renderOverlay();
     void loadNetworkSettings();
+    void loadTerminalProxySettings();
   } else if (name === "new") {
-    await ensureWorkspaceThen((ws) => createAndOpenSession(ws.id, ""));
+    const sourceDraftKey = draftKey();
+    const created = await ensureWorkspaceThen((ws) => createAndOpenSession(ws.id, ""));
+    if (!created) return true;
+    S.drafts.delete(sourceDraftKey);
+  } else if (name === "resume") {
+    S.sidebarCollapsed = false;
+    S.mobileSidebarOpen = true;
+    S.searchOpen = true;
+    S.search = "";
+    renderApp();
+    $("#sessionSearchInput")?.focus();
   } else if (name === "rewind" || name === "tree") {
     await openHistoryView(name === "tree" ? "tree" : "rewind");
   } else if (name === "compact") {
-    if (!sessionId) showToast("当前没有可压缩的会话", "warning");
-    else {
-      showToast("正在压缩当前会话…");
-      await post(`/api/sessions/${encodeURIComponent(sessionId)}/compact`);
-      showToast("上下文压缩完成");
-    }
-  } else if (name === "name") {
-    if (!sessionId) showToast("请先创建会话", "warning");
-    else {
-      const value = args || prompt("会话名称：", snapshotFor(sessionId).session?.title || "");
-      if (value?.trim()) {
-        await post(`/api/sessions/${encodeURIComponent(sessionId)}/set_name`, { name: value.trim() });
-        showToast("会话名称已更新");
+    const sourceDraftKey = draftKey();
+    const submittedDraft = S.draft;
+    clearComposerDraft();
+    showToast("正在压缩当前会话…");
+    try {
+      await post(`/api/sessions/${encodeURIComponent(sessionId)}/compact`, { customInstructions: args });
+    } catch (error) {
+      if (!S.drafts.get(sourceDraftKey)) {
+        S.drafts.set(sourceDraftKey, submittedDraft);
+        if (draftKey() === sourceDraftKey && !S.draft) {
+          setDraftValue(submittedDraft);
+          const input = $("#composerInput");
+          if (input) {
+            input.value = submittedDraft;
+            syncComposerInput();
+          }
+        }
       }
+      throw error;
+    }
+    showToast("上下文压缩完成");
+    return true;
+  } else if (name === "name") {
+    if (!args) showToast(`会话名称：${snapshotFor(sessionId).session?.title || "未命名"}`);
+    else {
+      await post(`/api/sessions/${encodeURIComponent(sessionId)}/set_name`, { name: args });
+      showToast("会话名称已更新");
     }
   } else if (name === "export") {
     await exportSessionLog(sessionId);
   } else if (name === "copy") {
     const assistant = [...(currentSnapshot().messages || [])].reverse().find((message) => message.kind === "assistant");
     const value = assistantMessageText(assistant);
-    if (!value) showToast("暂无可复制的助手回复", "warning");
-    else {
-      if (await copyText(value)) showToast("已复制最后一条助手回复");
-    }
+    if (!value) throw new Error("暂无可复制的助手回复");
+    if (!await copyText(value)) throw new Error("复制失败，请检查浏览器剪贴板权限");
+    showToast("已复制最后一条助手回复");
   } else if (name === "session") {
     const snap = currentSnapshot();
     const stats = snap.stats || {};
@@ -3587,24 +4061,27 @@ async function executeLocalSlashCommand(text) {
       `输入 ${fmtNum(tokens.input ?? 0)} · 输出 ${fmtNum(tokens.output ?? 0)} tok · 成本 ${typeof stats.cost === "number" ? formatCost(stats.cost) : "-"}`,
     ].join("\n"));
   }
+  if (S.currentSessionId === sessionId && S.draft.trim() === text.trim()) clearComposerDraft();
   return true;
 }
 
 async function sendDraft() {
+  if (S.pendingCreation) return;
+  if (S.clipboardBusy) return showToast("正在上传并解析文件，请稍候", "warning");
   const text = S.draft.trim();
   const attachments = [...S.draftAttachments];
   if (!text && attachments.length === 0) return;
   if (attachments.length > 0) {
     if (currentSnapshot().session?.streaming) {
-      showToast("生成过程中暂不支持排队图片，请停止当前生成后再发送", "warning");
+      showToast("生成过程中暂不支持排队附件，请停止当前生成后再发送", "warning");
       return;
     }
-    if (!modelSupportsImages()) {
+    if (attachments.some(isImageAttachment) && !modelSupportsImages()) {
       showToast("当前模型不支持图片输入，请切换视觉模型", "warning");
       return;
     }
     if (text.startsWith("/")) {
-      showToast("斜杠命令不能附带图片", "warning");
+      showToast("斜杠命令不能附带附件", "warning");
       return;
     }
   }
@@ -3614,6 +4091,7 @@ async function sendDraft() {
     showToast(error.message || String(error), "error");
     return;
   }
+  if (S.pendingCreation) return;
   let sessionId = S.currentSessionId;
   if (!sessionId) {
     const ws = currentWorkspace();
@@ -3622,7 +4100,7 @@ async function sendDraft() {
       if (!added) return;
       S.currentWorkspaceId = added.id;
     }
-    const title = text.slice(0, 40) || "图片会话";
+    const title = text.slice(0, 40) || attachments[0]?.name || "文件会话";
     sessionId = await createAndOpenSession(S.currentWorkspaceId || currentWorkspace().id, title, { keepDraft: true });
     if (!sessionId) return;
   }
@@ -3702,7 +4180,7 @@ function bindGlobalEvents() {
   globalKeyHandler = onGlobalKeydown;
   document.addEventListener("keydown", globalKeyHandler, true);
   if (globalPointerHandler) document.removeEventListener("pointerdown", globalPointerHandler, true);
-  globalPointerHandler = onPanelResizeStart;
+  globalPointerHandler = onGlobalPointerDown;
   document.addEventListener("pointerdown", globalPointerHandler, true);
   if (globalDragStartHandler) document.removeEventListener("dragstart", globalDragStartHandler, true);
   globalDragStartHandler = onWorkspaceDragStart;
@@ -3716,6 +4194,11 @@ function bindGlobalEvents() {
   if (globalDragEndHandler) document.removeEventListener("dragend", globalDragEndHandler, true);
   globalDragEndHandler = onWorkspaceDragEnd;
   document.addEventListener("dragend", globalDragEndHandler, true);
+}
+
+function onGlobalPointerDown(event) {
+  if (!event.target.closest(".pi-popoverAnchor")) closePopovers();
+  onPanelResizeStart(event);
 }
 
 function persistPanelWidth(side) {
@@ -3788,10 +4271,45 @@ function onGlobalKeydown(event) {
     return;
   }
   if (S.settingsOpen) {
+    const tab = event.target.closest?.("[data-settings-tab]");
+    if (tab && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) {
+      event.preventDefault();
+      const index = SETTINGS_TABS.findIndex((item) => item.id === tab.dataset.settingsTab);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? SETTINGS_TABS.length - 1
+        : (index + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) + SETTINGS_TABS.length) % SETTINGS_TABS.length;
+      selectSettingsTab(SETTINGS_TABS[next].id, true);
+    }
+    if (event.key === "Tab") {
+      const focusable = $$('.pi-settingsPanel button:not(:disabled), .pi-settingsPanel input:not(:disabled), .pi-settingsPanel select:not(:disabled), .pi-settingsPanel a[href], .pi-settingsPanel summary, .pi-settingsPanel [tabindex="0"]')
+        .filter((element) => element.tabIndex >= 0 && element.getClientRects().length);
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
     if (event.key === "Escape" && !S.maintenanceBusy) {
       event.preventDefault();
       S.settingsOpen = false;
       renderOverlay();
+    }
+    return;
+  }
+  if (S.filePreview && usesMobileFilePreview()) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeFilePreview();
+    } else if (event.key === "Tab") {
+      const focusable = $$('.pi-filePreview button:not(:disabled), .pi-filePreview a[href], .pi-filePreview iframe, .pi-filePreview [tabindex="0"]')
+        .filter((element) => element.tabIndex >= 0 && element.getClientRects().length);
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === $(".pI_x6G_detailsCol"))) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
     }
     return;
   }
@@ -3834,6 +4352,7 @@ function onWarmHover(ev) {
 }
 
 async function onClick(ev) {
+  if (!ev.target.closest(".pi-popoverAnchor")) closePopovers();
   if (S.searchOpen && !ev.target.closest(".qDHVXG_search")) {
     S.searchOpen = false;
     S.search = "";
@@ -3847,10 +4366,11 @@ async function onClick(ev) {
       fileLink.dataset.filePath,
       fileLink.dataset.fileLine ? Number(fileLink.dataset.fileLine) : null,
       fileLink.href,
+      fileLink,
     );
     return;
   }
-  if (S.commandMenuOpen && !ev.target.closest(".pi-commandMenu, #composerInput, [data-action=commands]")) closeCommandMenu();
+  if (S.commandMenuOpen && !ev.target.closest(".pi-commandMenu, #composerInput")) closeCommandMenu();
   const target = ev.target.closest("[data-action]");
   if (!target) {
     const newRow = ev.target.closest(".YDXeBa_sessionRow[data-new-session]");
@@ -3884,8 +4404,16 @@ async function onClick(ev) {
     scrollConversationToBottom();
   } else if (action === "file-preview-close") {
     closeFilePreview();
-  } else if (action === "file-preview-reveal") {
-    const path = S.filePreview?.path;
+  } else if (action === "file-preview-mode") {
+    if (!S.filePreview) return;
+    S.filePreview.mode = S.filePreview.mode === "source" ? "rendered" : "source";
+    renderFilePreview();
+    scrollFilePreviewToLine();
+  } else if (action === "file-preview-reveal" || action === "reveal-workspace") {
+    const path = action === "reveal-workspace"
+      ? S.workspaces.find((workspace) => workspace.id === target.dataset.workspace)?.path
+      : S.filePreview?.path;
+    closePopovers();
     if (!path) return;
     target.disabled = true;
     try {
@@ -3922,11 +4450,17 @@ async function onClick(ev) {
       ++S.openGeneration;
       S.currentSessionId = null;
       S.loadingSession = null;
+      S.newSessionPreferenceWorkspaceId = null;
       loadCurrentDraftValue();
+      try {
+        await refreshModelCatalog(null, S.currentWorkspaceId, { state: null });
+      } catch (error) {
+        console.error("[pi-web] loading workspace models failed:", error);
+      }
       queueRender(true);
     }
   } else if (action === "brand") {
-    if (S.currentSessionId) {
+    if (S.currentSessionId || S.pendingCreation?.generation === S.openGeneration) {
       rememberCurrentDraft();
       ++S.openGeneration;
       S.currentSessionId = null;
@@ -3955,6 +4489,9 @@ async function onClick(ev) {
     closePopovers();
     renderOverlay();
     void loadNetworkSettings();
+    void loadTerminalProxySettings();
+  } else if (action === "settings-tab") {
+    selectSettingsTab(target.dataset.settingsTab);
   } else if (action === "settings-close") {
     if (!S.maintenanceBusy) {
       S.settingsOpen = false;
@@ -3964,6 +4501,13 @@ async function onClick(ev) {
   } else if (action === "choose-theme") {
     setTheme(target.dataset.theme || "system");
     renderOverlay();
+  } else if (action === "choose-theme-style") {
+    setThemeStyle(target.dataset.themeStyle || "classic");
+    renderOverlay();
+  } else if (action === "choose-background") {
+    $("#backgroundFile")?.click();
+  } else if (action === "reset-background") {
+    await changeCustomBackground();
   } else if (action === "maintenance-update-reload") {
     await runMaintenance("update");
   } else if (action === "maintenance-reload") {
@@ -3983,7 +4527,7 @@ async function onClick(ev) {
   } else if (action === "remove-attachment") {
     const attachmentId = target.dataset.attachmentId;
     setDraftAttachments(S.draftAttachments.filter((attachment) => attachment.id !== attachmentId));
-    await deleteImageAttachment(attachmentId);
+    await deleteAttachment(attachmentId);
     queueRender(true, { conversation: true });
   } else if (action === "withdraw-queued-message") {
     await withdrawQueuedMessage(target);
@@ -4055,6 +4599,7 @@ async function onClick(ev) {
         state: { ...(snap.state || {}), model: selected, thinkingLevel },
         thinkingLevels,
       };
+      S.newSessionPreferenceWorkspaceId = S.currentWorkspaceId;
     }
     closePopovers();
     queueRender(true);
@@ -4073,6 +4618,7 @@ async function onClick(ev) {
         ...S.newSessionSnapshot,
         state: { ...(S.newSessionSnapshot.state || {}), thinkingLevel: target.dataset.level },
       };
+      S.newSessionPreferenceWorkspaceId = S.currentWorkspaceId;
     }
     closePopovers();
     queueRender(true);
@@ -4097,32 +4643,35 @@ async function onClick(ev) {
   } else if (action === "toggle-tool") {
     const card = target.closest(".CY-8Ka_root");
     const row = target.closest(".ztWv_q_callRow");
-    const detail = row?.querySelector(".Sxvs8a_root");
-    const expanded = detail ? !detail.hidden : false;
-    if (detail) detail.hidden = expanded;
-    card?.setAttribute("aria-expanded", String(!expanded));
-    const toolKey = row?.dataset.toolKey;
-    if (toolKey) {
-      if (expanded) S.expandedTools.delete(toolKey);
-      else S.expandedTools.add(toolKey);
+    const expanded = toggleMessageDetail(target, row?.querySelector(".Sxvs8a_root"));
+    if (expanded !== null) {
+      card?.setAttribute("aria-expanded", String(expanded));
+      const toolKey = row?.dataset.toolKey;
+      if (toolKey) {
+        if (expanded) S.expandedTools.add(toolKey);
+        else S.expandedTools.delete(toolKey);
+      }
     }
   } else if (action === "toggle-thinking") {
-    const detail = target.closest(".QWLzlG_root")?.querySelector(".QWLzlG_detail");
     const row = target.closest(".QWLzlG_row");
-    if (detail) {
-      detail.hidden = !detail.hidden;
-      row?.setAttribute("aria-expanded", String(!detail.hidden));
+    const expanded = toggleMessageDetail(target, target.closest(".QWLzlG_root")?.querySelector(".QWLzlG_detail"));
+    if (expanded !== null) {
+      row?.setAttribute("aria-expanded", String(expanded));
+      const key = row?.dataset.thinkingKey;
+      if (key) {
+        if (expanded) S.expandedThinking.add(key);
+        else S.expandedThinking.delete(key);
+      }
     }
   } else if (action === "toggle-compaction") {
     const row = target.closest(".pi-compactionCard");
-    const detail = row?.querySelector(".gdEzaW_compactionBody");
-    if (detail) {
-      detail.hidden = !detail.hidden;
-      target.setAttribute("aria-expanded", String(!detail.hidden));
+    const expanded = toggleMessageDetail(target, row?.querySelector(".gdEzaW_compactionBody"));
+    if (expanded !== null) {
+      target.setAttribute("aria-expanded", String(expanded));
       const key = row.dataset.compactionKey;
       if (key) {
-        if (detail.hidden) S.expandedCompactions.delete(key);
-        else S.expandedCompactions.add(key);
+        if (expanded) S.expandedCompactions.add(key);
+        else S.expandedCompactions.delete(key);
       }
     }
   } else if (action === "session-menu") {
@@ -4179,7 +4728,7 @@ async function onClick(ev) {
         ...(S.attachmentDrafts.get(sessionDraftKey) || []),
         ...(S.failedAttachmentDrafts.get(sessionId) || []),
       ];
-      await Promise.all(orphanedAttachments.map((attachment) => deleteImageAttachment(attachment.id)));
+      await Promise.all(orphanedAttachments.map((attachment) => deleteAttachment(attachment.id)));
       S.snapshots.delete(sessionId);
       S.drafts.delete(sessionDraftKey);
       S.failedDrafts.delete(sessionId);
@@ -4233,6 +4782,8 @@ async function onClick(ev) {
     const resolve = pickerResolve;
     closeWorkspacePicker();
     resolve?.(null);
+  } else if (action === "background-jobs") {
+    openBackgroundJobs();
   } else if (action === "context-info") {
     const stats = currentSnapshot().stats;
     if (!stats) {
@@ -4263,20 +4814,13 @@ async function onClick(ev) {
     </div>`);
   } else if (action === "pi-agent-chip") {
     alert("该 Web UI 由 pi coding agent 的 RPC 会话驱动。");
-  } else if (action === "commands") {
-    const input = $("#composerInput");
-    setDraftValue("/");
-    if (input) {
-      input.value = S.draft;
-      input.focus();
-      input.setSelectionRange(1, 1);
-      syncComposerInput();
-    }
-    openCommandMenu();
+  } else if (action === "upload-files") {
+    selectAttachmentFiles();
   } else if (action === "workspace-menu") {
     const ws = S.workspaces.find((w) => w.id === target.dataset.workspace);
     if (ws) {
       openPopover(target, `<div class="_7KE1Ra_menu pi-popover pi-menu" role="menu">
+        ${usesMobileSidebar() ? "" : `<button type="button" role="menuitem" class="_7KE1Ra_cell" data-action="reveal-workspace" data-workspace="${esc(ws.id)}"><span class="_7KE1Ra_cellLabel">在系统文件管理器中打开</span></button>`}
         <button type="button" role="menuitem" class="_7KE1Ra_cell" data-action="discover-workspace" data-workspace="${esc(ws.id)}"><span class="_7KE1Ra_cellLabel">扫描 pi 会话</span></button>
         <button type="button" role="menuitem" class="_7KE1Ra_cell" data-action="remove-workspace" data-workspace="${esc(ws.id)}"><span class="_7KE1Ra_cellLabel">移除工作区</span></button>
       </div>`);
@@ -4493,23 +5037,28 @@ function requireLogin() {
 }
 
 let eventSource;
+let eventWatchdog;
+let lastEventAt = 0;
 let resyncPending;
 
 async function resyncAfterReconnect() {
   if (resyncPending) return resyncPending;
   resyncPending = (async () => {
-    const boot = await api("/api/bootstrap");
+    const boot = await api("/api/bootstrap", { signal: AbortSignal.timeout(15_000) });
     S.workspaces = applySavedWorkspaceOrder(boot.workspaces || []);
     S.serverInstanceId = boot.instanceId || null;
     S.lanEnabled = boot.lanEnabled === true;
     S.lanUrls = boot.lanUrls || [];
     S.passwordConfigured = boot.passwordConfigured === true;
     if (S.settingsOpen || networkSettings.data) void loadNetworkSettings();
+    if (S.settingsOpen || terminalProxySettings.data) void loadTerminalProxySettings();
     const id = S.currentSessionId;
     const generation = S.openGeneration;
     if (id && S.workspaces.some((workspace) => workspace.sessions?.some((session) => session.id === id))) {
       const before = S.snapshots.get(id);
-      const data = await post(`/api/sessions/${encodeURIComponent(id)}/open`);
+      const data = await api(`/api/sessions/${encodeURIComponent(id)}/open`, {
+        method: "POST", body: "{}", signal: AbortSignal.timeout(15_000),
+      });
       if (S.snapshots.get(id) === before) S.snapshots.set(id, data);
     } else if (id && generation === S.openGeneration) {
       rememberCurrentDraft();
@@ -4529,8 +5078,21 @@ function connectEvents() {
   eventSource?.close();
   const es = new EventSource("/api/events");
   eventSource = es;
-  es.onopen = () => { void resyncAfterReconnect(); };
+  lastEventAt = Date.now();
+  clearInterval(eventWatchdog);
+  // Heartbeats arrive every 25s, including when the model is idle. Some mobile
+  // networks leave a dead stream open without notifying EventSource.
+  eventWatchdog = setInterval(() => {
+    if (document.hidden || loginPromise || eventSource !== es) return;
+    if (Date.now() - lastEventAt > 60_000) connectEvents();
+  }, 5_000);
+  es.onopen = () => {
+    lastEventAt = Date.now();
+    void resyncAfterReconnect();
+  };
   es.onmessage = (ev) => {
+    if (eventSource !== es) return;
+    lastEventAt = Date.now();
     try {
       const event = JSON.parse(ev.data);
       if (event.type === "heartbeat") return;
@@ -4605,8 +5167,14 @@ window.addEventListener("online", () => { if (eventSource && !loginPromise) conn
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && eventSource && !loginPromise) connectEvents();
 });
+setTheme(S.theme);
+setThemeStyle(S.themeStyle);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (S.theme === "system") applyTheme();
+});
 updateViewport();
 bindGlobalEvents();
+const backgroundReady = restoreCustomBackground();
 async function startApp() {
   await loadBootstrap();
   connectEvents();

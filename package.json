@@ -1,10 +1,18 @@
 {
   "name": "@oversk7/pi-web-dsh-style",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "An unofficial DSH-styled Windows browser UI for pi coding agent with configurable LAN and native frp relay access",
   "type": "module",
   "license": "MIT",
   "author": "oversk7",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oversk7/pi-web-dsh-style.git"
+  },
+  "homepage": "https://github.com/oversk7/pi-web-dsh-style#readme",
+  "bugs": {
+    "url": "https://github.com/oversk7/pi-web-dsh-style/issues"
+  },
   "keywords": [
     "pi-package",
     "pi-coding-agent",
@@ -21,12 +29,16 @@
   },
   "files": [
     "abort-session.ts",
+    "background-jobs.ts",
     "attachment-store.ts",
+    "attachment-parser.ts",
     "file-preview.ts",
+    "extension-settings.ts",
     "index.ts",
     "local-session.ts",
     "network-access.ts",
     "network-settings.ts",
+    "terminal-proxy.ts",
     "frp-process.ts",
     "pi-rpc.ts",
     "sse-channel.ts",
@@ -41,11 +53,12 @@
     "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
+    "build:markdown": "node scripts/build-markdown.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test tests/*.test.ts",
     "check:package": "node scripts/check-package.mjs",
     "verify": "npm run typecheck && npm test && npm run check:package",
-    "prepack": "npm run verify"
+    "prepack": "npm run build:markdown && npm run verify"
   },
   "pi": {
     "extensions": [
@@ -61,6 +74,7 @@
     "@earendil-works/pi-coding-agent": "0.85.0",
     "@earendil-works/pi-server": "0.85.0",
     "@types/node": "^22.19.19",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3"
   },
   "publishConfig": {
@@ -69,6 +83,10 @@
     "tag": "latest"
   },
   "dependencies": {
-    "highlight.js": "^11.12.0"
+    "fast-xml-parser": "^5.11.1",
+    "fflate": "^0.8.3",
+    "highlight.js": "^11.12.0",
+    "markdown-it": "^15.0.2",
+    "pdfjs-dist": "^6.3.289"
   }
 }

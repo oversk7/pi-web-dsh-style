@@ -1,5 +1,7 @@
 # @oversk7/pi-web-dsh-style
 
+[GitHub 源码](https://github.com/oversk7/pi-web-dsh-style) · [问题与建议](https://github.com/oversk7/pi-web-dsh-style/issues) · [npm](https://www.npmjs.com/package/@oversk7/pi-web-dsh-style) · [Pi 扩展目录](https://pi.dev/packages/@oversk7/pi-web-dsh-style)
+
 采用 DeepSeek Harness（DSH）视觉风格、面向 Windows 的非官方 Pi Coding Agent 本地浏览器界面扩展。后端使用 Pi 的公开 RPC 模式，每个会话对应独立的 RPC 进程；历史会话可直接从 Pi 会话文件恢复和渲染。
 
 > 仅承诺 Windows 10/11。首次启动只监听 `127.0.0.1`；电脑网页的“设置 → 手机访问”可配置仅本机、局域网和服务器中转。之后 `pi --web` 使用已保存的模式。
@@ -39,6 +41,19 @@ pi --web
 /web --local
 /web --stop
 ```
+
+### 网页会话中的斜杠命令
+
+输入 `/` 可查看当前可用命令。Web 内置命令包括 `/settings`、`/model`、`/thinking`、`/export`、`/copy`、`/name`、`/session`、`/new`、`/resume`、`/rewind`、`/tree`、`/compact` 和 `/reload`。
+
+- `/model provider/model` 精确匹配时切换模型；未唯一匹配时打开带搜索词的模型选择器。`/thinking high` 切换当前模型支持的思考强度，两者不带参数时打开选择器。
+- `/compact 压缩要求` 会将要求传给 Pi；`/name 名称` 修改会话名称，不带参数时显示当前名称。
+- `/resume` 打开侧栏会话搜索；`/export` 下载 HTML 到浏览器下载目录，暂不接受导出路径或 JSONL 格式参数。
+- 网页会话中的 `/reload` 只重载当前会话的扩展与配置。要重载整个 Web 服务，请使用设置中的“重新加载”或在宿主 Pi 终端执行 `/reload`。
+
+扩展命令、提示词模板和 `/skill:名称` 由当前会话的 Pi RPC 进程执行。未知命令会报错并保留草稿，不会作为普通消息发送给模型；普通消息需要避免以 `/` 开头。
+
+`/scoped-models`、`/import`、`/share`、`/fork`、`/clone`、`/trust`、`/changelog`、`/hotkeys`、`/login`、`/logout` 和 `/quit` 尚未提供对应的 Web 操作，输入时会显示说明。需要这些 Pi 功能时请使用终端。
 
 ### 手机通过局域网访问
 
@@ -129,6 +144,12 @@ npm pack --dry-run
 npm login --registry=https://registry.npmjs.org
 npm publish --access public --tag latest
 ```
+
+## 反馈与相关扩展
+
+欢迎通过 [GitHub Issues](https://github.com/oversk7/pi-web-dsh-style/issues) 反馈问题、提出建议，或分享使用场景。报告问题时，请附上扩展版本、Pi 版本、Windows 版本和复现步骤；涉及手机访问时，请说明使用的是局域网还是服务器中转。
+
+同一作者的 [pi-pwsh-notify](https://github.com/oversk7/pi-pwsh-notify) 为 Pi 提供 Windows PowerShell 7 工具，以及后台任务完成自动通知功能。
 
 ## 许可证
 

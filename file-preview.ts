@@ -55,6 +55,8 @@ export interface FilePreviewData {
   path: string;
   name: string;
   language: string;
+  kind: "code" | "markdown" | "html";
+  content?: string;
   highlighted: boolean;
   highlightedHtml: string;
   lineCount: number;
@@ -68,7 +70,9 @@ function escapeHtml(value: string): string {
 export function buildFilePreview(filePath: string, data: Buffer): FilePreviewData {
   const name = basename(filePath);
   const text = data.toString("utf8").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
-  const language = LANGUAGES_BY_FILENAME[name.toLowerCase()] ?? LANGUAGES_BY_EXTENSION[extname(name).toLowerCase()] ?? "plaintext";
+  const extension = extname(name).toLowerCase();
+  const language = LANGUAGES_BY_FILENAME[name.toLowerCase()] ?? LANGUAGES_BY_EXTENSION[extension] ?? "plaintext";
+  const kind = language === "markdown" ? "markdown" : [".html", ".htm"].includes(extension) ? "html" : "code";
   const canHighlight = data.byteLength <= MAX_HIGHLIGHT_BYTES && Boolean(hljs.getLanguage(language));
   let highlightedHtml = escapeHtml(text);
   let highlighted = false;
@@ -86,6 +90,8 @@ export function buildFilePreview(filePath: string, data: Buffer): FilePreviewDat
     path: filePath,
     name,
     language,
+    kind,
+    ...(kind !== "code" ? { content: text } : {}),
     highlighted,
     highlightedHtml,
     lineCount: text.split("\n").length,
