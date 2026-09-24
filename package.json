@@ -1,6 +1,6 @@
 {
   "name": "@oversk7/pi-web-dsh-style",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "description": "An unofficial DSH-styled Windows browser UI for pi coding agent with configurable LAN and native frp relay access",
   "type": "module",
   "license": "MIT",
@@ -48,6 +48,7 @@
     "windows-clipboard.ts",
     "windows-rpc-job.ps1",
     "web/",
+    "docs/",
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
