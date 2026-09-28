@@ -312,6 +312,20 @@ body[data-workspace-dragging] .YDXeBa_projectRow[draggable=true]{cursor:grabbing
 .CY-8Ka_root[data-state=running] .CY-8Ka_leading,.CY-8Ka_root[data-state=running] .CY-8Ka_title{color:var(--dsw-alias-state-business-primary)}
 .CY-8Ka_root[data-state=error] .CY-8Ka_leading,.CY-8Ka_root[data-state=error] .CY-8Ka_title{color:var(--dsw-alias-state-error-primary)}
 
+/* Agent delegation details */
+.pi-subagentDetail{display:flex;flex-direction:column;gap:12px;padding:10px 14px 14px;min-width:0}
+.pi-subagentField{min-width:0}
+.pi-subagentLabel{margin-bottom:4px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.pi-subagentText{margin:0;color:var(--dsw-alias-label-primary);font:13px/21px var(--dsw-font-family);white-space:pre-wrap;overflow-wrap:anywhere}
+.pi-subagentField .Y0dWHa_payload{min-height:0}
+.pi-subagentNotice{color:var(--dsw-alias-label-secondary);font-size:13px;line-height:21px;overflow-wrap:anywhere}
+.pi-subagentResult{min-width:0;overflow-wrap:anywhere}
+.pi-subagentResult ._markdown_1nba0_5{font-size:13px;line-height:21px}
+.pi-subagentResult.Y0dWHa_payloadError{color:var(--dsw-alias-state-error-primary)}
+.pi-subagentConversation{min-width:0}
+.pi-subagentConversation summary{cursor:pointer;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:20px;margin-bottom:6px}
+.pi-subagentConversation summary:focus-visible{outline:1px solid var(--dsw-alias-state-business-primary);outline-offset:2px}
+
 /* Extension notifications */
 .pi-toast{z-index:1500;box-sizing:border-box;position:fixed;right:24px;bottom:24px;max-width:min(420px,calc(100vw - 48px));background:var(--dsw-specific-menu);border:1px solid var(--dsw-alias-border-l2);box-shadow:var(--dsw-shadow-lv3);color:var(--dsw-alias-label-primary);border-radius:12px;padding:10px 14px;font-size:13px;line-height:20px;animation:pi-toast-in .16s var(--ds-ease-in-out)}
 .pi-toast-warning{border-color:var(--dsw-alias-state-warn-secondary);color:var(--dsw-alias-state-warn-label)}

@@ -1573,6 +1573,93 @@ function compactionUsageSummary(usage) {
   };
 }
 
+function subagentPresentation(tool) {
+  const toolName = (tool?.name || tool?.toolName || "").toLowerCase();
+  if (!["agent", "steer_subagent", "get_subagent_result"].includes(toolName)) return null;
+  const rawOutput = tool.result?.content || tool.text || "";
+  const isError = Boolean(tool.result?.isError || tool.isError);
+  if (toolName === "get_subagent_result") {
+    const header = /^Agent: ([^\r\n]+)\r?\nType: ([^|\r\n]+)\s*\|\s*Status: ([^|\r\n]+)[^\r\n]*\r?\nDescription: ([^\r\n]*)\r?\n(?:\r?\n)?/.exec(rawOutput);
+    const status = isError ? "error" : header?.[3]?.trim().toLowerCase() || (tool.running ? "fetching" : "");
+    const body = header ? rawOutput.slice(header[0].length) : rawOutput;
+    const trace = /\r?\n\r?\n--- Agent Conversation ---\r?\n/.exec(body);
+    return {
+      retrieval: true,
+      target: tool.subagentResult?.target || header?.[1] || "",
+      type: tool.subagentResult?.type || header?.[2]?.trim() || "",
+      task: tool.subagentResult?.task || header?.[4] || "",
+      prompt: "",
+      status,
+      output: trace ? body.slice(0, trace.index) : body,
+      conversation: trace ? body.slice(trace.index + trace[0].length) : "",
+      isError: isError || ["error", "failed"].includes(status),
+    };
+  }
+  if (toolName === "steer_subagent") {
+    const feedback = tool.subagentFeedback;
+    const sent = !isError && /^Steering message sent to agent .+\./.test(rawOutput.trim());
+    return {
+      feedback: true,
+      target: feedback?.target || rawOutput.match(/^Steering message sent to agent (.+?)\. (?:The agent|$)/)?.[1] || "",
+      type: feedback?.type || "",
+      task: feedback?.task || "",
+      prompt: feedback?.message || "",
+      promptUnavailable: tool.type === "toolCall" && typeof feedback?.message !== "string",
+      output: sent ? "" : rawOutput,
+      isError,
+    };
+  }
+  const receipt = !isError && /^Agent started in background\.(?:\r?\n|$)/.test(rawOutput.trim());
+  const receiptField = (label) => receipt ? rawOutput.match(new RegExp(`^${label}:\\s*(.*)$`, "m"))?.[1]?.trim() || "" : "";
+  return {
+    type: tool.subagent?.type || receiptField("Type"),
+    task: tool.subagent?.task || receiptField("Description"),
+    prompt: tool.subagent?.prompt || "",
+    promptUnavailable: tool.type === "toolCall" && typeof tool.subagent?.prompt !== "string",
+    output: receipt ? "" : rawOutput,
+    isError,
+  };
+}
+
+function subagentTitle(agent, fallback) {
+  if (agent?.feedback || agent?.retrieval) {
+    const target = agent.type || (agent.target.length > 24 ? `${agent.target.slice(0, 21)}…` : agent.target) || "Agent";
+    return agent.retrieval ? `${t("查看结果")} ← ${target}` : `${t("补充指令")} → ${target}`;
+  }
+  return agent?.type ? `Agent · ${agent.type}` : fallback;
+}
+
+function subagentStatusLabel(status) {
+  return { completed: "已完成", done: "已完成", running: "运行中", pending: "等待执行", queued: "等待执行", scheduled: "等待执行", error: "失败", failed: "失败", aborted: "已取消", cancelled: "已取消", canceled: "已取消", fetching: "正在获取结果" }[status] || status;
+}
+
+function subagentSummary(agent) {
+  if (agent.retrieval) return [agent.task, t(subagentStatusLabel(agent.status))].filter(Boolean).join(" · ");
+  return agent.feedback
+    ? [agent.task, agent.prompt.replace(/\s+/g, " ").slice(0, 120)].filter(Boolean).join(" · ")
+    : agent.task;
+}
+
+function renderSubagentDetail(agent) {
+  const field = (label, value) => value ? `<div class="pi-subagentField"><div class="pi-subagentLabel">${label}</div><pre class="pi-subagentText" translate="no">${esc(value)}</pre></div>` : "";
+  if (agent.retrieval) {
+    const label = agent.isError ? "失败原因" : agent.status === "running" ? "当前进展" : "执行结果";
+    const result = agent.output
+      ? `<div class="pi-subagentField"><div class="pi-subagentLabel">${label}</div><div class="pi-subagentResult ${agent.isError ? "Y0dWHa_payloadError" : ""}"><div class="_markdown_1nba0_5">${markdown(agent.output)}</div></div></div>`
+      : `<div class="pi-subagentNotice">${agent.status === "fetching" ? "正在获取结果" : agent.status === "running" ? "子 agent 仍在运行，尚无结果。" : "暂无结果内容。"}</div>`;
+    const conversation = agent.conversation ? `<details class="pi-subagentConversation"><summary>执行记录</summary><pre class="pi-subagentText" translate="no">${esc(agent.conversation)}</pre></details>` : "";
+    return `<div class="Sxvs8a_body pi-subagentDetail">${field("结果来源", [agent.type, agent.task].filter(Boolean).join(" · ") || agent.target)}${agent.status ? `<div class="pi-subagentField"><div class="pi-subagentLabel">状态</div><div>${esc(subagentStatusLabel(agent.status))}</div></div>` : ""}${result}${conversation}</div>`;
+  }
+  const label = agent.feedback ? "指令内容" : "提示词";
+  const identity = agent.feedback
+    ? field("目标 agent", [agent.type, agent.task].filter(Boolean).join(" · ") || agent.target)
+    : field("类型", agent.type) + field("委派任务", agent.task);
+  const notice = agent.feedback
+    ? "当前运行时未提供完整指令内容。请等待所有会话空闲，在设置 → 维护中重新加载运行时，然后刷新页面。"
+    : "当前运行时未提供完整提示词。请等待所有会话空闲，在设置 → 维护中重新加载运行时，然后刷新页面。";
+  return `<div class="Sxvs8a_body pi-subagentDetail">${identity}${field(label, agent.prompt)}${agent.promptUnavailable ? `<div class="pi-subagentField"><div class="pi-subagentLabel">${label}</div><div class="pi-subagentNotice">${notice}</div></div>` : ""}${agent.output ? `<div class="pi-subagentField"><div class="pi-subagentLabel">${agent.isError ? "失败" : "结果"}</div><pre class="Y0dWHa_payload ${agent.isError ? "Y0dWHa_payloadError" : ""}" translate="no">${esc(agent.output)}</pre></div>` : ""}</div>`;
+}
+
 function renderMessageDetail(msg, blockIndex) {
   if (msg.kind === "compaction") {
     const usage = compactionUsageSummary(msg.usage);
@@ -1589,6 +1676,8 @@ function renderMessageDetail(msg, blockIndex) {
   if (block?.type === "thinking") {
     return `<div class="Y0dWHa_thinkingQuote"><pre class="Y0dWHa_payload">${esc(block.thinking || "")}</pre></div>`;
   }
+  const agent = subagentPresentation(block || msg);
+  if (agent) return renderSubagentDetail(agent);
   const argsText = block?.argumentsText || "";
   const output = block?.result?.content || (msg.kind === "bashExecution" ? msg.output : msg.text) || "";
   const isError = block ? block.result?.isError : msg.kind === "toolResult" && msg.isError;
@@ -1704,15 +1793,16 @@ function renderMessage(msg, messageIndex) {
     return `<div class="pi-assistantMessageGroup">${content}${error}${actions}</div>`;
   }
   if (msg.kind === "toolResult") {
-    const output = msg.text || "";
+    const agent = subagentPresentation(msg);
+    const output = agent ? agent.output : msg.text || "";
     const lineCount = output ? output.split("\n").length : 0;
-    const hasDetail = output !== "";
+    const hasDetail = Boolean(agent ? agent.type || agent.task || agent.target || agent.status || agent.prompt || output : output);
     const toolKey = `result:${msg.toolCallId || msg.timestamp || msg.toolName || "tool"}`;
     const expanded = hasDetail && S.expandedTools.has(toolKey);
     return `<div class="Md3f7G_flowItem" data-chat-flow-kind="tool-result"><div class="ztWv_q_callRow" data-tool-key="${esc(toolKey)}"><div class="CY-8Ka_card">
-      <div class="CY-8Ka_root" data-state="${msg.isError ? "error" : "ok"}" ${hasDetail ? `role="button" data-expandable aria-expanded="${expanded}" data-action="toggle-tool"` : ""}>
-        <span class="CY-8Ka_leading">${ICONS.bash}</span><span class="CY-8Ka_title">${esc(msg.toolName || "Tool")}</span><span class="CY-8Ka_sep"></span>
-        <span class="CY-8Ka_summary ${msg.isError ? "CY-8Ka_errorSummary" : ""}">${msg.isError ? "失败" : "完成"}${lineCount ? ` · ${lineCount} 行输出` : ""}</span>
+      <div class="CY-8Ka_root" data-state="${agent?.isError || msg.isError ? "error" : agent?.status === "running" ? "running" : "ok"}" ${hasDetail ? `role="button" data-expandable aria-expanded="${expanded}" data-action="toggle-tool"` : ""}>
+        <span class="CY-8Ka_leading">${ICONS.bash}</span><span class="CY-8Ka_title">${esc(subagentTitle(agent, msg.toolName || "Tool"))}</span><span class="CY-8Ka_sep"></span>
+        <span class="CY-8Ka_summary ${agent?.isError || msg.isError ? "CY-8Ka_errorSummary" : ""}">${agent ? esc(subagentSummary(agent) || (msg.isError ? "失败" : "")) : `${msg.isError ? "失败" : "完成"}${lineCount ? ` · ${lineCount} 行输出` : ""}`}</span>
       </div>
       ${hasDetail ? `<div class="Sxvs8a_root" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg) : ""}</div>` : ""}
     </div></div></div>`;
@@ -1749,13 +1839,14 @@ function renderBlock(block, msg, idx, messageIndex) {
   }
   if (block.type === "toolCall") {
     const result = block.result;
-    const state = result ? (result.isError ? "error" : "ok") : block.running ? "running" : "ok";
+    const agent = subagentPresentation(block);
+    const state = agent?.isError || result?.isError ? "error" : agent?.status === "running" || block.running ? "running" : "ok";
     const argsText = block.argumentsText || "";
-    const resultText = result?.content || "";
+    const resultText = agent ? agent.output : result?.content || "";
     const resultLines = resultText ? resultText.split("\n").length : 0;
-    const hasDetail = argsText !== "" || resultText !== "";
+    const hasDetail = Boolean(agent ? agent.type || agent.task || agent.target || agent.status || agent.prompt || agent.promptUnavailable || resultText : argsText || resultText);
     const resultHint = resultLines ? `${resultLines} 行输出` : state === "running" ? "运行中" : "";
-    const summary = [argsText, resultHint].filter(Boolean).join(" · ");
+    const summary = agent ? subagentSummary(agent) : [argsText, resultHint].filter(Boolean).join(" · ");
     const toolKey = `call:${block.id || `${block.name || "tool"}:${idx}`}`;
     const expanded = hasDetail && S.expandedTools.has(toolKey);
     return `<div class="Md3f7G_flowItem" data-chat-flow-kind="tool-call">
@@ -1763,8 +1854,8 @@ function renderBlock(block, msg, idx, messageIndex) {
         <div class="CY-8Ka_card"><div class="CY-8Ka_root" data-sample="${esc(block.name || "tool")}" data-variant="${esc(block.name || "tool")}" data-state="${state}" ${hasDetail ? `role="button" data-expandable aria-expanded="${expanded}" data-action="toggle-tool"` : ""}>
           <span class="CY-8Ka_leading"><span class="CY-8Ka_iconIdle">${ICONS.bash}</span></span>
           <span class="CY-8Ka_visuallyHidden">${state === "error" ? "失败" : state === "running" ? "运行中" : "完成"}</span>
-          <span class="CY-8Ka_title">${esc(block.name || "Tool")}</span><span class="CY-8Ka_sep"></span>
-          <span class="CY-8Ka_summary ${result?.isError ? "CY-8Ka_errorSummary" : ""}">${esc(summary)}</span>
+          <span class="CY-8Ka_title">${esc(subagentTitle(agent, block.name || "Tool"))}</span><span class="CY-8Ka_sep"></span>
+          <span class="CY-8Ka_summary ${state === "error" ? "CY-8Ka_errorSummary" : ""}">${esc(summary)}</span>
         </div>
         ${hasDetail ? `<div class="Sxvs8a_root" data-block-index="${idx}" ${expanded ? "" : "hidden"}>${expanded ? renderMessageDetail(msg, idx) : ""}</div>` : ""}
         </div>

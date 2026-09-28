@@ -8,6 +8,9 @@ export interface RenderedBlock {
   name?: string;
   arguments?: unknown;
   argumentsText?: string;
+  subagent?: { type: string; task: string; prompt: string };
+  subagentFeedback?: { target: string; type: string; task: string; message: string };
+  subagentResult?: { target: string; type: string; task: string };
   result?: { content: string; isError: boolean; details?: unknown };
   running?: boolean;
 }
@@ -37,11 +40,56 @@ export interface RenderedMessage {
 }
 
 export function browserMessages(messages: RenderedMessage[]): RenderedMessage[] {
+  type AgentIdentity = { id: string; type: string; task: string };
+  const agents = new Map<string, AgentIdentity>();
+  const names = new Map<string, string>();
+  const types = new Map<string, string | null>();
+  const text = (value: unknown): string => typeof value === "string" ? value : "";
+  const lookup = (target: string): AgentIdentity | undefined => agents.get(target) || agents.get(names.get(target) || types.get(target.toLowerCase()) || "");
   return messages.map((message) => !message.blocks ? message : {
     ...message,
     blocks: message.blocks.map((block) => {
       if (block.type !== "toolCall") return block;
-      const { arguments: _arguments, result, ...visible } = block;
+      const { arguments: args, result, ...visible } = block;
+      // Keep display fields without sending every tool's raw arguments to the browser.
+      const record = args && typeof args === "object" ? args as Json : {};
+      const toolName = block.name?.toLowerCase();
+      if (toolName === "agent") {
+        const resumed = lookup(text(record.resume));
+        if (args && typeof args === "object") {
+          visible.subagent = {
+            type: text(record.subagent_type) || resumed?.type || "",
+            task: text(record.description) || resumed?.task || "",
+            prompt: text(record.prompt),
+          };
+          visible.argumentsText = visible.subagent.task;
+        }
+        const details = result?.details && typeof result.details === "object" ? result.details as Json : {};
+        const receiptField = (label: string): string => result?.content.match(new RegExp(`^${label}:[ \\t]*(.*)$`, "m"))?.[1]?.trim() || "";
+        const id = text(details.agentId) || receiptField("Agent ID") || resumed?.id;
+        if (id && !result?.isError) {
+          const identity = {
+            id,
+            type: visible.subagent?.type || text(details.subagentType) || receiptField("Type"),
+            task: visible.subagent?.task || text(details.description) || receiptField("Description"),
+          };
+          agents.set(id, identity);
+          if (text(record.name)) names.set(text(record.name), id);
+          // A type is a useful fallback only when it identifies one agent unambiguously.
+          const typeKey = identity.type.toLowerCase();
+          if (typeKey) {
+            const previous = types.get(typeKey);
+            types.set(typeKey, previous === undefined || previous === id ? id : null);
+          }
+        }
+      } else if ((toolName === "steer_subagent" || toolName === "get_subagent_result") && args && typeof args === "object") {
+        const target = text(record.agent_id);
+        const identity = lookup(target);
+        const agent = { target, type: identity?.type || "", task: identity?.task || "" };
+        if (toolName === "steer_subagent") visible.subagentFeedback = { ...agent, message: text(record.message) };
+        else visible.subagentResult = agent;
+        visible.argumentsText = [identity?.type || target, identity?.task].filter(Boolean).join(" · ");
+      }
       return result
         ? { ...visible, result: { content: result.content, isError: result.isError } }
         : visible;
