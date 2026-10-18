@@ -1,5 +1,5 @@
 import { build } from "esbuild";
-import { readFile, writeFile, readdir } from "node:fs/promises";
+import { readFile, writeFile, readdir, cp, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const root = new URL("../", import.meta.url);
@@ -16,7 +16,26 @@ await build({
   banner: { js: "/*! Bundled Markdown renderer. Licenses: markdown.LICENSE.txt */" },
 });
 
-const packages = ["markdown-it", "entities", "linkify-it", "mdurl", "punycode.js", "uc.micro", "highlight.js"];
+await rm(new URL("web/assets/mermaid/", root), { recursive: true, force: true });
+await build({
+  absWorkingDir: fileURLToPath(root),
+  entryPoints: { mermaid: fileURLToPath(import.meta.resolve("mermaid")) },
+  outdir: "web/assets/mermaid",
+  chunkNames: "chunks/[name]-[hash]",
+  bundle: true,
+  splitting: true,
+  format: "esm",
+  platform: "browser",
+  target: "es2022",
+  minify: true,
+  legalComments: "linked",
+});
+await rm(new URL("web/assets/mermaid.js", root), { force: true });
+await rm(new URL("web/assets/mermaid.js.LEGAL.txt", root), { force: true });
+await cp(new URL("node_modules/katex/dist/katex.min.css", root), new URL("web/assets/katex.min.css", root));
+await cp(new URL("node_modules/katex/dist/fonts/", root), new URL("web/assets/fonts/", root), { recursive: true });
+
+const packages = ["markdown-it", "entities", "linkify-it", "mdurl", "punycode.js", "uc.micro", "highlight.js", "katex", "markdown-it-texmath", "mermaid"];
 const licenses = [];
 for (const name of packages) {
   const directory = new URL(`node_modules/${name}/`, root);

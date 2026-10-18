@@ -16,7 +16,7 @@ A browser interface for [Pi Coding Agent](https://pi.dev), inspired by DeepSeek 
 
 ## English
 
-Pi Web brings your Pi sessions to desktop and mobile browsers. Run multiple workspaces and sessions, inspect streaming replies and tool calls, preview files, revisit conversation branches, and use models, slash commands, extensions and skills. Pi and its tools keep running on your own computer. Choose light or dark themes and a custom chat background.
+Pi Web brings your Pi sessions to desktop and mobile browsers. Run multiple workspaces and sessions, inspect streaming replies and tool calls, preview files, revisit conversation branches, and use models, slash commands, extensions and skills. Pi and its tools keep running on your own computer. Choose light or dark themes and a custom chat background. Replies and Markdown file previews render mathematical formulas and Mermaid diagrams, with diagram modules loaded on demand.
 
 ### Requirements
 
@@ -40,6 +40,12 @@ pi --web
 
 You can also enter `/web` in an existing Pi terminal. The page opens on your computer; the default local address is `http://127.0.0.1:18789`. To stop the service, run `/web --stop` or exit the host Pi process. Closing the browser tab alone does not stop it.
 
+Each visible page subscribes to its selected session, receives an initial snapshot, and then receives only changes. Hidden tabs pause live updates and notifications; returning to the page synchronizes the latest state. Pi and its tools continue running while no page is viewing them.
+
+Switching back to a newly created or previously loaded session shows its cached content immediately and keeps the composer available while refreshing. Repeated opens share pending requests, and sessions with a running process return their current snapshot without waiting for RPC refreshes.
+
+In the in-app workspace directory browser, click the pencil to paste a full path. The list loads the corresponding directory and filters matching folders, including deeply nested paths. Click a folder to select it, or press Enter to navigate directly; a trailing separator previews the folder's contents. Relative file links in replies resolve against the selected session's workspace.
+
 The interface starts in Chinese. To switch to English, open **设置 (Settings) → 外观 (Appearance) → 界面语言 (Interface language) → English**. Your choice is saved in this browser.
 
 ### Phone and remote access
@@ -61,7 +67,7 @@ npm run verify
 
 ## 简体中文
 
-Pi Web 为 [Pi Coding Agent](https://pi.dev) 提供浏览器界面，灵感来自 DeepSeek Harness。在桌面或手机上切换多个工作区与会话，查看流式回答、工具调用和文件预览，浏览会话分支，并使用模型、斜杠命令、扩展与技能。Pi 和工具仍运行在自己的电脑上。支持明暗主题和自定义聊天背景。
+Pi Web 为 [Pi Coding Agent](https://pi.dev) 提供浏览器界面，灵感来自 DeepSeek Harness。在桌面或手机上切换多个工作区与会话，查看流式回答、工具调用和文件预览，浏览会话分支，并使用模型、斜杠命令、扩展与技能。Pi 和工具仍运行在自己的电脑上。支持明暗主题和自定义聊天背景。回答和 Markdown 文件预览支持数学公式与 Mermaid 图表，图表模块按需加载。
 
 ### 系统要求
 
@@ -84,6 +90,12 @@ pi --web
 ```
 
 也可以在已有的 Pi 终端中输入 `/web`。网页会在本机打开，默认地址为 `http://127.0.0.1:18789`。执行 `/web --stop` 或退出宿主 Pi 可停止服务；仅关闭浏览器标签页不会停止服务。
+
+每个可见网页只订阅正在查看的会话，首次接收快照，随后只传输变化内容。隐藏标签页会暂停实时更新和通知，返回网页后同步最新状态。没有网页查看时，Pi 和工具仍会继续运行。
+
+切回新建或已加载的会话时，立即显示缓存内容，后台刷新期间仍可编辑输入。重复打开会复用待完成请求；已有运行进程的会话直接返回当前快照，避免等待 RPC 刷新。
+
+在内置工作区目录浏览器中，点击铅笔图标即可粘贴完整路径，列表会加载对应目录并筛选匹配的文件夹，支持多层嵌套路径。点击文件夹选择，或按 Enter 直接跳转；路径末尾带分隔符时预览该文件夹的内容。回答中的相对文件链接按当前会话的工作区解析。
 
 界面默认使用中文。打开 **设置 → 外观 → 界面语言**，即可一键切换中文或 English；选择会保存在当前浏览器。
 

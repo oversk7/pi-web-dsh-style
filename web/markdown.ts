@@ -1,4 +1,6 @@
 import MarkdownIt from "markdown-it";
+import katex from "katex";
+import texmath from "markdown-it-texmath";
 import hljs from "highlight.js/lib/common";
 import dockerfile from "highlight.js/lib/languages/dockerfile";
 import powershell from "highlight.js/lib/languages/powershell";
@@ -6,7 +8,7 @@ import powershell from "highlight.js/lib/languages/powershell";
 hljs.registerLanguage("dockerfile", dockerfile);
 hljs.registerLanguage("powershell", powershell);
 
-function localFileLink(target: string) {
+function localFileLink(target: string, workspace = false) {
   let value = target.trim();
   let line: number | null = null;
   const location = /#L(\d+)(?:C\d+)?$/i.exec(value) || /:(\d+)(?::\d+)?$/.exec(value);
@@ -22,12 +24,51 @@ function localFileLink(target: string) {
     }
   }
   value = value.replace(/^\/([A-Za-z]:[\\/])/, "$1");
-  if (!/^[A-Za-z]:[\\/]/.test(value) && !/^\\\\[^\\]+\\[^\\]+/.test(value)) return null;
+  if (!/^[A-Za-z]:[\\/]/.test(value) && !/^\\\\[^\\]+\\[^\\]+/.test(value)) {
+    if (!workspace || /^[a-z][a-z\d+.-]*:|^\/\//i.test(value) || /[?#]/.test(value)) return null;
+    if (!/\.(?:md|markdown|mdx|txt|html?|css|[cm]?[jt]sx?|json|ya?ml|toml|py|rs|go|java|c|cpp|h|hpp|cs|sh|ps1|sql|xml|csv)$/i.test(value)) return null;
+    try {
+      value = decodeURIComponent(value).replace(/^\/+/, "");
+    } catch {
+      return null;
+    }
+  }
   const href = `/api/fs/view?path=${encodeURIComponent(value)}${line ? `#L${line}` : ""}`;
   return { path: value, line, href };
 }
 
+const formulaCache = new Map<string, string>();
+let formulaCacheBytes = 0;
+
+function renderFormula(source: string, options: katex.KatexOptions) {
+  if (source.length > 16 * 1024) throw new Error("Formula exceeds rendering limit");
+  const key = `${options.displayMode ? "display" : "inline"}:${source}`;
+  const cached = formulaCache.get(key);
+  if (cached !== undefined) {
+    formulaCache.delete(key);
+    formulaCache.set(key, cached);
+    return cached;
+  }
+  const html = katex.renderToString(source, options);
+  const bytes = (key.length + html.length) * 2;
+  if (bytes <= 1024 * 1024) {
+    formulaCache.set(key, html);
+    formulaCacheBytes += bytes;
+    while (formulaCache.size > 128 || formulaCacheBytes > 1024 * 1024) {
+      const oldest = formulaCache.keys().next().value!;
+      formulaCacheBytes -= (oldest.length + formulaCache.get(oldest)!.length) * 2;
+      formulaCache.delete(oldest);
+    }
+  }
+  return html;
+}
+
 const parser = new MarkdownIt({ html: false, breaks: false, linkify: true });
+parser.use(texmath, {
+  engine: { renderToString: renderFormula },
+  delimiters: ["dollars", "brackets"],
+  katexOptions: { trust: false, strict: "ignore", throwOnError: false, maxExpand: 1000, maxSize: 20 },
+});
 const InlineState = parser.inline.State;
 parser.inline.State = class extends InlineState {
   scanDelims(start: number, canSplitWord: boolean) {
@@ -52,7 +93,14 @@ parser.validateLink = (target) => Boolean(localFileLink(target)) || validateLink
 parser.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
   const token = tokens[index];
   const target = String(token.attrGet("href") || "");
-  const local = localFileLink(target);
+  let local = localFileLink(target, true);
+  if (local && typeof env?.cwd === "string" && !/^[A-Za-z]:[\\/]|^\\\\/.test(local.path)) {
+    const base = new URL("file:///");
+    base.pathname = `${env.cwd.replace(/\\/g, "/").replace(/%/g, "%25").replace(/\/+$/, "")}/`;
+    const relative = local.path.replace(/\\/g, "/").split("/").map(encodeURIComponent).join("/");
+    const resolved = new URL(relative, base);
+    local = localFileLink(`${resolved.href}${local.line ? `#L${local.line}` : ""}`) || local;
+  }
   if (local) {
     token.attrSet("href", local.href);
     token.attrJoin("class", "md-local-file");
@@ -76,9 +124,14 @@ parser.renderer.rules.image = (tokens, index, options, env, renderer) => {
   return renderImage(tokens, index, options, env, renderer);
 };
 
-parser.renderer.rules.fence = (tokens, index) => {
+parser.renderer.rules.fence = (tokens, index, _options, env) => {
   const token = tokens[index];
   const language = token.info.trim().split(/\s+/)[0];
+  if (language.toLowerCase() === "mermaid") {
+    const lastLine = (env?.markdownLines as string[] | undefined)?.[token.map![1] - 1] || "";
+    const closed = new RegExp(`^\\s*(?:>\\s*)*[${token.markup[0]}]{${token.markup.length},}\\s*$`).test(lastLine);
+    return `<div class="md-mermaid" data-mermaid-source="${escape(token.content)}" data-mermaid-complete="${closed}"><pre class="md-code-block"><code>${escape(token.content)}</code></pre></div>\n`;
+  }
   let code = escape(token.content);
   // Bound synchronous highlighting work while streaming large tool-generated snippets.
   if (language && hljs.getLanguage(language) && token.content.length <= 32 * 1024) {
@@ -113,6 +166,7 @@ parser.renderer.rules.task_checkbox = (tokens, index) => {
   return `<input type="checkbox" disabled${checked ? " checked" : ""} aria-label="${checked ? "已完成" : "未完成"}"/> `;
 };
 
-export function markdown(src: unknown): string {
-  return parser.render(String(src ?? ""));
+export function markdown(src: unknown, context: { cwd?: string } = {}): string {
+  const text = String(src ?? "");
+  return parser.render(text, { ...context, markdownLines: text.replace(/\r\n?/g, "\n").split("\n") });
 }

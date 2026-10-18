@@ -40,7 +40,7 @@ function fixture() {
   };
   let resolveHistory!: (value: unknown) => void;
   const context = createContext({
-    S: state, document: { activeElement: null },
+    S: state, document: { activeElement: null }, syncEventSubscription() {},
     $: (selector: string) => selector === "#conversationMount" ? mount : nodes[selector] || null,
     el: (html: string) => new TestNode(html.startsWith("<header>") ? ".wSkVaW_header" : ".pi-historyView", html),
     renderHeader: headerHtml, renderHistoryView: historyHtml,

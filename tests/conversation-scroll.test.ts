@@ -21,7 +21,7 @@ function fixture(top = 1500) {
     document: { activeElement: null }, $: (selector: string) => nodes[selector],
     conversationNavScroll: scroll, conversationLastScrollTop: top, conversationFollowingBottom: top === 1500, conversationTouchY: null,
     el() {}, renderHeader() {}, reconcileConversationNavigator() {}, patchComposerState() {}, bindConversationNavigator() {},
-    scheduleConversationNavigatorLayout() {},
+    scheduleConversationNavigatorLayout() {}, syncEventSubscription() {},
     reconcileMessageFlow: () => { scroll.scrollHeight += 100; },
     requestAnimationFrame: (fn: () => void) => { frames.push(fn); },
   });

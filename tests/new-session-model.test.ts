@@ -3,6 +3,41 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+
+const serverSource = await readFile(new URL("../server.ts", import.meta.url), "utf8");
+const catalogReuseSource = serverSource.slice(serverSource.indexOf("async function modelCatalogForNewSession("), serverSource.indexOf("function applyModelInfo("))
+  .replace("cwd: string, preferredModel?: unknown): Promise<ModelCatalog>", "cwd, preferredModel)");
+
+test("new session model discovery reuses only recent results for its workspace and awaits active refreshes", async () => {
+  const catalog = { models: [{ provider: "test", id: "default" }], defaultModel: { provider: "test", id: "default" } };
+  const recent = new Map([["workspace", { catalog, refreshedAt: 1000 }]]);
+  const refreshes = new Map<string, Promise<unknown>>();
+  let probes = 0;
+  let now = 1001;
+  const context = {
+    normalizePath: (cwd: string) => cwd,
+    recentModelCatalogs: recent, modelCatalogRefreshes: refreshes, MODEL_CATALOG_REUSE_MS: 30_000,
+    Date: { now: () => now },
+    findCatalogModel: (models: any[], preferred: any) => models.find((model) => model.provider === preferred.provider && model.id === preferred.modelId),
+    discoverFreshModelCatalog: async () => { probes += 1; return catalog; },
+  };
+  const get = (cwd = "workspace", model?: unknown) => runInNewContext(`${catalogReuseSource}\nmodelCatalogForNewSession(${JSON.stringify(cwd)}, ${JSON.stringify(model)})`, context);
+  assert.equal(await get(), catalog);
+  assert.equal(probes, 0);
+  await get("other");
+  assert.equal(probes, 1);
+  await get("workspace", { provider: "test", modelId: "newly-added" });
+  assert.equal(probes, 2);
+  const updated = { models: [] };
+  refreshes.set("workspace", Promise.resolve(updated));
+  assert.equal(await get(), updated);
+  assert.equal(probes, 2);
+  refreshes.clear();
+  now = 31_000;
+  await get();
+  assert.equal(probes, 3);
+});
 
 test("new sessions show and start with the current Pi defaults or explicit choices", { timeout: 30_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-web-new-model-"));
@@ -76,8 +111,19 @@ test("new sessions show and start with the current Pi defaults or explicit choic
     assert.equal(explicitRunning.state.model.id, "old");
     assert.equal(explicitRunning.state.thinkingLevel, "off");
 
+    const nextDefault = await post("/api/workspaces/ws/sessions");
+    assert.equal(nextDefault.state.model.id, "new", "an explicit session choice does not change Pi defaults");
+    assert.equal(nextDefault.state.thinkingLevel, "high");
+
     const unavailable = await post("/api/workspaces/ws/sessions", { model: { provider: "test", modelId: "probe-only" } });
     assert.equal(unavailable.state.model.id, "probe-only");
+    const creationCalls = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(creationCalls.filter((call) => call.session === "probe" && call.type === "get_state").length, 1,
+      "consecutive creations reuse one fresh catalog without inheriting an explicit session's model choice");
+    await post("/api/workspaces/ws/models");
+    const refreshedCalls = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(refreshedCalls.filter((call) => call.session === "probe" && call.type === "get_state").length, 2,
+      "explicit model refresh still probes fresh defaults");
     const rejected = await fetch(`${url}/api/sessions/${unavailable.session.id}/prompt`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "must not send" }),
     });

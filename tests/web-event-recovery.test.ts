@@ -4,7 +4,8 @@ import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 
 const app = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
-const connect = app.slice(app.indexOf("function connectEvents()"), app.indexOf('window.addEventListener("resize"'));
+const connect = app.slice(app.indexOf("function disconnectEvents()"), app.indexOf("async function resyncAfterReconnect()"))
+  + app.slice(app.indexOf("function connectEvents("), app.indexOf('window.addEventListener("resize"'));
 
 test("silent event streams reconnect, while heartbeats and hidden pages prevent unnecessary reconnects", () => {
   let now = 0;
@@ -18,7 +19,7 @@ test("silent event streams reconnect, while heartbeats and hidden pages prevent 
     close() { this.closed = true; }
   }
   const context = createContext({
-    EventSource, document, Date: { now: () => now },
+    EventSource, document, S: { currentSessionId: "one" }, Date: { now: () => now },
     setInterval: (callback: () => void) => { tick = callback; return 1; },
     clearInterval() {}, resyncAfterReconnect: () => { syncs++; },
   });

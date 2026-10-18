@@ -4,6 +4,7 @@ import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 
 const app = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
+const markdownSource = app.slice(app.indexOf("function markdown(text)"), app.indexOf("function currentWorkspace()"));
 const layoutSource = app.slice(app.indexOf("function clampPanelWidth("), app.indexOf("function fileNameFromPath("));
 const previewSource = app.slice(app.indexOf("let filePreviewReturnFocus"), app.indexOf("function renderApp("));
 const clickSource = app.slice(app.indexOf("async function onClick("), app.indexOf("function moveWorkspace("));
@@ -40,23 +41,39 @@ for (const [width, touch, fullscreen] of [[390, true, true], [844, true, true], 
   });
 }
 
+test("Markdown links follow the selected session workspace after launching from .pi", () => {
+  const state = {
+    currentSessionId: "doc-session", currentWorkspaceId: "launch", snapshots: new Map(),
+    workspaces: [
+      { id: "launch", path: "C:/Users/seuov/.pi", sessions: [] },
+      { id: "docs", path: "D:/QQbot/GuiXiuXian2", sessions: [{ id: "doc-session" }] },
+    ],
+  };
+  const context = createContext({ S: state, renderMarkdown: (_text: string, options: { cwd: string }) => options.cwd });
+  assert.equal(runInContext(`${markdownSource}\nmarkdown("[Document](llmdoc/note.md)")`, context), "D:/QQbot/GuiXiuXian2");
+  state.currentSessionId = "";
+  state.currentWorkspaceId = "docs";
+  assert.equal(runInContext('markdown("[Document](llmdoc/note.md)")', context), "D:/QQbot/GuiXiuXian2");
+});
+
 function previewFixture() {
   let requests = 0;
   let previewFocused = 0;
   let linkFocused = 0;
+  const urls: string[] = [];
   let resolveRequest: (value: unknown) => void = () => {};
-  const state = { filePreview: null as null | { path: string; line?: number; loading?: boolean }, filePreviewGeneration: 0, mobileSidebarOpen: true, draft: "unsent draft" };
+  const state = { currentSessionId: "doc-session", filePreview: null as null | { path: string; line?: number; loading?: boolean }, filePreviewGeneration: 0, mobileSidebarOpen: true, draft: "unsent draft" };
   const link = { isConnected: true, focus: (options: object) => { assert.equal((options as { preventScroll: boolean }).preventScroll, true); linkFocused += 1; } };
   const context = createContext({
     S: state, document: { activeElement: link }, link, usesMobileFilePreview: () => true,
     $: () => ({ focus: () => { previewFocused += 1; } }),
     fileNameFromPath: (path: string) => path.split("/").at(-1),
     renderFilePreview() {}, applyFrameLayout() {}, requestAnimationFrame() {}, scrollFilePreviewToLine() {},
-    api: () => { requests += 1; return new Promise(resolve => { resolveRequest = resolve; }); },
+    api: (url: string) => { urls.push(url); requests += 1; return new Promise(resolve => { resolveRequest = resolve; }); },
   });
   runInContext(previewSource, context);
   return {
-    state, context,
+    state, context, urls,
     open: (): Promise<void> => runInContext('openFilePreview("D:/project/file.ts", 30, "/api/fs/view", link)', context),
     close: () => runInContext("closeFilePreview()", context),
     resolve: () => resolveRequest({ path: "D:/project/file.ts", highlightedHtml: "source" }),
@@ -78,6 +95,20 @@ test("mobile preview focuses the panel, reuses the same file, and returns to the
   assert.equal(view.state.filePreview, null);
   assert.equal(view.state.draft, "unsent draft");
   assert.deepEqual(view.counts(), { requests: 1, previewFocused: 2, linkFocused: 1 });
+});
+
+test("file previews include session context and reload when the session changes", async () => {
+  const view = previewFixture();
+  const opening = view.open();
+  assert.match(view.urls[0], /&sessionId=doc-session$/);
+  view.resolve();
+  await opening;
+  view.state.currentSessionId = "other-session";
+  const second = view.open();
+  assert.equal(view.counts().requests, 2);
+  assert.match(view.urls[1], /&sessionId=other-session$/);
+  view.resolve();
+  await second;
 });
 
 test("closing a mobile preview while loading prevents its late response from reopening it", async () => {

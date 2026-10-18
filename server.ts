@@ -1,7 +1,9 @@
-import type { ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { promisify } from "node:util";
+import { brotliCompress, constants as zlibConstants, gzip } from "node:zlib";
 import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, unlink } from "node:fs/promises";
 import { homedir, platform, tmpdir } from "node:os";
@@ -181,6 +183,7 @@ interface RuntimeSession {
   streaming: boolean;
   needsAttention: boolean;
   starting?: Promise<void>;
+  openRefresh?: Promise<void>;
   modelRefresh?: Promise<void>;
   commandRefresh?: Promise<void>;
   lastUsed: number;
@@ -242,6 +245,8 @@ let heartbeat: ReturnType<typeof setInterval> | undefined;
 const MAX_IDLE_PROCESSES = 1;
 const modelInfoCache = new Map<string, ModelInfo>();
 const modelCatalogRefreshes = new Map<string, Promise<ModelCatalog>>();
+const recentModelCatalogs = new Map<string, { catalog: ModelCatalog; refreshedAt: number }>();
+const MODEL_CATALOG_REUSE_MS = 30_000;
 const commandCache = new Map<string, SlashCommandInfo[]>();
 const exportDownloads = new Map<string, ExportDownload>();
 const attachments = new AttachmentStore();
@@ -517,13 +522,23 @@ function isImmediateExtensionCommand(record: RuntimeSession, message: string): b
 
 function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: number) {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  return (...args: A) => {
+  const schedule = (...args: A) => {
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => fn(...args), ms);
+    timer = setTimeout(() => {
+      timer = undefined;
+      fn(...args);
+    }, ms);
   };
+  return Object.assign(schedule, {
+    cancel() {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+    },
+  });
 }
 
 const scheduleSave = debounce(() => {
+  if (shuttingDown) return;
   stateSaveChain = stateSaveChain.then(saveStateNow).catch(() => {});
 }, 120);
 
@@ -545,6 +560,7 @@ async function loadState(): Promise<void> {
   }) ?? { version: 1, workspaces: [], sessions: [] };
   sessions = new Map();
   modelInfoCache.clear();
+  recentModelCatalogs.clear();
   commandCache.clear();
   if (state.modelCache) {
     for (const [cwd, cached] of Object.entries(state.modelCache)) {
@@ -605,7 +621,14 @@ function firstMessageTitle(session: SessionInfo): string {
 // ---------------------------------------------------------------------------
 
 function broadcastEvent(event: Json): void {
-  for (const client of [...sseClients]) sendSseEvent(client, event);
+  for (const client of [...sseClients]) {
+    if (event.sessionId && client.sessionId !== event.sessionId) continue;
+    sendSseEvent(client, event);
+  }
+}
+
+function hasSessionSubscribers(sessionId: string): boolean {
+  return [...sseClients].some((client) => !client.closed && client.sessionId === sessionId);
 }
 
 function sessionSummary(record: RuntimeSession): Json {
@@ -669,12 +692,17 @@ function setPendingQueue(record: RuntimeSession, queue: RpcQueueSnapshot): void 
 const snapshotScheduler = createSnapshotScheduler<RuntimeSession>(emitSessionSnapshot);
 
 function broadcastSessionSnapshot(record: RuntimeSession): void {
-  if (shuttingDown) return;
+  if (shuttingDown || !hasSessionSubscribers(record.id)) return;
   snapshotScheduler.schedule(record.id, record, !record.streaming || record.dialogs.length > 0);
 }
 
 function emitSessionSnapshot(record: RuntimeSession): void {
-  broadcastEvent({
+  if (shuttingDown || !hasSessionSubscribers(record.id)) return;
+  broadcastEvent(sessionSnapshot(record));
+}
+
+function sessionSnapshot(record: RuntimeSession): Json {
+  return {
     type: "snapshot",
     sessionId: record.id,
     session: sessionSummary(record),
@@ -688,7 +716,7 @@ function emitSessionSnapshot(record: RuntimeSession): void {
     messages: browserMessages(snapshotMessages(record)),
     pendingQueue: pendingQueueSnapshot(record),
     dialogs: record.dialogs,
-  });
+  };
 }
 
 function serializeWorkspaces(): Json[] {
@@ -917,10 +945,24 @@ async function discoverFreshModelCatalog(cwd: string): Promise<ModelCatalog> {
   })();
   modelCatalogRefreshes.set(key, task);
   try {
-    return await task;
+    const catalog = await task;
+    recentModelCatalogs.set(key, { catalog, refreshedAt: Date.now() });
+    return catalog;
   } finally {
     modelCatalogRefreshes.delete(key);
   }
+}
+
+async function modelCatalogForNewSession(cwd: string, preferredModel?: unknown): Promise<ModelCatalog> {
+  const key = normalizePath(cwd);
+  const refreshing = modelCatalogRefreshes.get(key);
+  if (refreshing) return refreshing;
+  const recent = recentModelCatalogs.get(key);
+  if (recent && Date.now() - recent.refreshedAt < MODEL_CATALOG_REUSE_MS
+    && (!preferredModel || findCatalogModel(recent.catalog.models, preferredModel))) {
+    return recent.catalog;
+  }
+  return discoverFreshModelCatalog(cwd);
 }
 
 function applyModelInfo(record: RuntimeSession, info: ModelInfo): void {
@@ -1444,6 +1486,19 @@ async function ensureProcess(record: RuntimeSession): Promise<void> {
   return task;
 }
 
+function refreshOpenedSession(record: RuntimeSession): void {
+  if (record.openRefresh || record.streaming || record.starting) return;
+  record.openRefresh = (async () => {
+    await Promise.allSettled([refreshState(record), refreshMessages(record)]);
+    if (record.models.length === 0) await refreshModels(record).catch(() => {});
+    applyCachedModelInfo(record);
+    await refreshStats(record);
+    broadcastSessionSnapshot(record);
+  })().catch((error) => {
+    console.error("[pi-web] open session refresh failed:", error);
+  }).finally(() => { record.openRefresh = undefined; });
+}
+
 async function openSessionRecord(record: RuntimeSession): Promise<void> {
   record.lastUsed = Date.now();
   applyCachedCommands(record);
@@ -1502,6 +1557,14 @@ async function openSessionRecord(record: RuntimeSession): Promise<void> {
     // Keep a brand-new session virtual until the first RPC-backed action.
     applyCachedModelInfo(record);
     record.status = "stopped";
+    broadcastSessionSnapshot(record);
+    return;
+  }
+
+  if (record.proc && record.state) {
+    // Live events keep this snapshot current; browsing must not wait for RPC.
+    applyCachedModelInfo(record);
+    refreshOpenedSession(record);
     broadcastSessionSnapshot(record);
     return;
   }
@@ -1591,7 +1654,7 @@ async function createSession(
   const ws = state.workspaces.find((w) => w.id === workspaceId);
   if (!ws) throw new Error("workspace not found");
   const info = modelInfoFromCatalog(
-    await discoverFreshModelCatalog(ws.path),
+    await modelCatalogForNewSession(ws.path, preferences.model),
     preferences.model,
     preferences.thinkingLevel,
   );
@@ -1880,21 +1943,11 @@ async function listDirectories(input: string): Promise<Json> {
     .map((e) => ({ name: e.name, path: join(target, e.name), hidden: e.name.startsWith(".") }))
     .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
   const crumbs: { name: string; path: string; hidden: boolean }[] = [];
-  {
-    const parts: string[] = [];
-    let current = target;
-    for (;;) {
-      parts.unshift(current);
-      const up = dirname(current);
-      if (up === current) break;
-      current = up;
-    }
-    let acc = parts[0];
-    crumbs.push({ name: parts[0], path: parts[0], hidden: false });
-    for (const part of parts.slice(1)) {
-      acc = join(acc, part);
-      crumbs.push({ name: part, path: acc, hidden: part.startsWith(".") });
-    }
+  for (let current = target; ; current = dirname(current)) {
+    const isRoot = dirname(current) === current;
+    const name = isRoot ? current : basename(current);
+    crumbs.unshift({ name, path: current, hidden: !isRoot && name.startsWith(".") });
+    if (isRoot) break;
   }
   const parent = dirname(target) === target ? null : dirname(target);
   return { path: target, home, parent, crumbs, entries: dirs, truncated: false };
@@ -2041,19 +2094,161 @@ function filePathFromUrl(url: string): string {
   return path;
 }
 
-async function serveStatic(res: ServerResponse, url: string): Promise<void> {
+type StaticEncoding = "br" | "gzip" | "identity";
+interface StaticAsset {
+  metadata: string;
+  data: Buffer;
+  etag: string;
+  bytes: number;
+  compressed: Partial<Record<"br" | "gzip", Buffer>>;
+  compressing: Partial<Record<"br" | "gzip", Promise<Buffer>>>;
+}
+
+const STATIC_CACHE_LIMIT = 32 * 1024 * 1024;
+const STATIC_ENTRY_LIMIT = 8 * 1024 * 1024;
+const staticAssets = new Map<string, StaticAsset>();
+const staticReads = new Map<string, Promise<StaticAsset>>();
+let staticCacheBytes = 0;
+const compressBrotliStatic = promisify(brotliCompress);
+const compressStatic = {
+  br: (data: Buffer) => compressBrotliStatic(data, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 4 } }),
+  gzip: promisify(gzip),
+};
+
+function evictStaticAsset(path: string): void {
+  const entry = staticAssets.get(path);
+  if (entry) staticCacheBytes -= entry.bytes;
+  staticAssets.delete(path);
+}
+
+function trimStaticCache(): void {
+  while (staticCacheBytes > STATIC_CACHE_LIMIT || staticAssets.size > 256) {
+    evictStaticAsset(staticAssets.keys().next().value!);
+  }
+}
+
+function staticMetadata(info: Awaited<ReturnType<typeof stat>>): string {
+  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}:${info.ctimeMs}`;
+}
+
+async function loadStaticAsset(path: string): Promise<StaticAsset> {
+  // Revalidate metadata even for cached entries so local rebuilds are visible immediately.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const info = await stat(path);
+    if (!info.isFile()) throw new Error("not a file");
+    const metadata = staticMetadata(info);
+    const cached = staticAssets.get(path);
+    if (cached?.metadata === metadata) {
+      staticAssets.delete(path);
+      staticAssets.set(path, cached);
+      return cached;
+    }
+    evictStaticAsset(path);
+    const key = `${path}\0${metadata}`;
+    let reading = staticReads.get(key);
+    if (!reading) {
+      reading = (async () => {
+        const data = await readFile(path);
+        if (staticMetadata(await stat(path)) !== metadata) throw new Error("static asset changed during read");
+        const entry: StaticAsset = {
+          metadata, data, etag: `W/"${createHash("sha256").update(data).digest("hex")}"`,
+          bytes: data.length, compressed: {}, compressing: {},
+        };
+        if (entry.bytes <= STATIC_ENTRY_LIMIT) {
+          evictStaticAsset(path);
+          staticAssets.set(path, entry);
+          staticCacheBytes += entry.bytes;
+          trimStaticCache();
+        }
+        return entry;
+      })();
+      staticReads.set(key, reading);
+    }
+    try {
+      return await reading;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    } finally {
+      if (staticReads.get(key) === reading) staticReads.delete(key);
+    }
+  }
+  throw new Error("unable to read static asset");
+}
+
+function staticEncoding(header: string | undefined, compressible: boolean): StaticEncoding | undefined {
+  if (!header?.trim()) return "identity";
+  const qualities = new Map<string, number>();
+  for (const part of header.split(",")) {
+    const [name, ...parameters] = part.trim().toLowerCase().split(";");
+    if (!name) continue;
+    const q = parameters.map((parameter) => parameter.trim()).find((parameter) => parameter.startsWith("q="));
+    const value = q === undefined ? 1 : Number(q.slice(2));
+    qualities.set(name, Number.isFinite(value) && value >= 0 && value <= 1 ? value : 0);
+  }
+  const quality = (encoding: StaticEncoding): number => qualities.get(encoding)
+    ?? (encoding === "identity" ? (qualities.get("*") === 0 ? 0 : 1) : (qualities.get("*") ?? 0));
+  const encodings: StaticEncoding[] = compressible ? ["br", "gzip", "identity"] : ["identity"];
+  return encodings.filter((encoding) => quality(encoding) > 0)
+    .sort((a, b) => quality(b) - quality(a))[0];
+}
+
+async function staticRepresentation(path: string, entry: StaticAsset, encoding: StaticEncoding): Promise<Buffer> {
+  if (encoding === "identity") return entry.data;
+  const cached = entry.compressed[encoding];
+  if (cached) return cached;
+  let compressing = entry.compressing[encoding];
+  if (!compressing) {
+    compressing = compressStatic[encoding](entry.data).then((data) => {
+      if (staticAssets.get(path) === entry && entry.bytes + data.length <= STATIC_ENTRY_LIMIT) {
+        entry.compressed[encoding] = data;
+        entry.bytes += data.length;
+        staticCacheBytes += data.length;
+        trimStaticCache();
+      }
+      return data;
+    }).finally(() => { delete entry.compressing[encoding]; });
+    entry.compressing[encoding] = compressing;
+  }
+  return compressing;
+}
+
+function staticEtagMatches(header: string | undefined, etag: string): boolean {
+  return Boolean(header?.split(",").some((candidate) => {
+    const tag = candidate.trim();
+    return tag === "*" || tag.replace(/^W\//, "") === etag.replace(/^W\//, "");
+  }));
+}
+
+async function serveStatic(req: IncomingMessage, res: ServerResponse, url: string): Promise<void> {
   const filePath = filePathFromUrl(url);
   try {
-    const data = await readFile(filePath);
+    const entry = await loadStaticAsset(filePath);
     const ext = extname(filePath).toLowerCase();
-    res.writeHead(200, {
-      "content-type": MIME[ext] ?? "application/octet-stream",
-      "cache-control": "no-cache",
-    });
-    res.end(data);
+    const encoding = staticEncoding(req.headers["accept-encoding"], /^(?:\.(?:js|css|html|json|svg|txt|wasm|woff2?|ttf|otf))$/.test(ext));
+    const relative = filePath.slice(WEB_DIR.length + 1).split(sep).join("/");
+    res.setHeader("content-type", MIME[ext] ?? "application/octet-stream");
+    res.setHeader("cache-control", /^assets\/mermaid\/chunks\/[^/]+-[a-zA-Z0-9]{8}\.js$/.test(relative)
+      ? "public, max-age=31536000, immutable" : "no-cache");
+    res.setHeader("vary", "Accept-Encoding");
+    res.setHeader("etag", entry.etag);
+    if (!encoding) {
+      res.writeHead(406, { "content-length": 0 });
+      res.end();
+      return;
+    }
+    if (encoding !== "identity") res.setHeader("content-encoding", encoding);
+    if ((req.method === "GET" || req.method === "HEAD") && staticEtagMatches(req.headers["if-none-match"], entry.etag)) {
+      res.writeHead(304);
+      res.end();
+      return;
+    }
+    const data = await staticRepresentation(filePath, entry, encoding);
+    res.setHeader("content-length", data.length);
+    res.writeHead(200);
+    res.end(req.method === "HEAD" ? undefined : data);
   } catch {
-    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-    res.end("not found");
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "content-length": 9 });
+    res.end(req.method === "HEAD" ? undefined : "not found");
   }
 }
 
@@ -2337,7 +2532,16 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
     const input = url.searchParams.get("path")?.trim();
     if (!input) return sendJson(res, 400, { error: "path is required" });
     try {
-      const target = normalizePath(input);
+      const sessionId = url.searchParams.get("sessionId");
+      const workspaceId = url.searchParams.get("workspaceId");
+      const session = sessionId ? sessions.get(sessionId) : undefined;
+      const workspace = workspaceId ? state.workspaces.find((item) => item.id === workspaceId) : undefined;
+      if (sessionId && !session) return sendJson(res, 404, { error: "session not found" });
+      if (workspaceId && !workspace) return sendJson(res, 404, { error: "workspace not found" });
+      const activeSession = !sessionId && !workspaceId && state.currentSessionId ? sessions.get(state.currentSessionId) : undefined;
+      const activeWorkspace = !sessionId && !workspaceId
+        ? state.workspaces.find((item) => item.id === (activeSession?.workspaceId ?? state.currentWorkspaceId)) : undefined;
+      const target = normalizePath(resolve(session?.cwd ?? workspace?.path ?? activeWorkspace?.path ?? activeSession?.cwd ?? process.cwd(), input));
       const info = await stat(target);
       if (!info.isFile()) return sendJson(res, 400, { error: "path is not a file" });
       const image = url.searchParams.get("format") === "image";
@@ -2413,6 +2617,9 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
   }
 
   if (method === "GET" && path === "/api/events") {
+    const sessionId = url.searchParams.get("sessionId") || undefined;
+    const subscribedSession = sessionId ? sessions.get(sessionId) : undefined;
+    if (sessionId && !subscribedSession) return sendJson(res, 404, { error: "session not found" });
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-store",
@@ -2424,10 +2631,13 @@ async function handleApi(req: import("node:http").IncomingMessage, res: ServerRe
     const removeClient = () => {
       closeSseClient(client);
       sseClients.delete(client);
+      if (sessionId && !hasSessionSubscribers(sessionId)) snapshotScheduler.cancel(sessionId);
     };
     client = createSseClient(res, removeClient);
+    client.sessionId = sessionId;
     sseClients.add(client);
     req.on("close", removeClient);
+    if (subscribedSession) sendSseEvent(client, sessionSnapshot(subscribedSession));
     return true;
   }
 
@@ -3290,7 +3500,6 @@ async function shutdownServer(): Promise<void> {
   await attachments.close();
   if (heartbeat) clearInterval(heartbeat);
   heartbeat = undefined;
-  await saveStateNow().catch(() => {});
   const activeServer = server;
   server = undefined;
   serverUrl = undefined;
@@ -3303,6 +3512,9 @@ async function shutdownServer(): Promise<void> {
       activeServer.close(() => resolveClose());
     });
   }
+  scheduleSave.cancel();
+  await stateSaveChain;
+  await saveStateNow().catch(() => {});
   process.off("exit", exitHook);
   process.off("SIGINT", sigintHook);
   process.off("SIGTERM", sigintHook);
@@ -3376,7 +3588,7 @@ export async function startWebServer(options: {
         if (!handled) sendJson(res, 404, { error: "not found" });
         return;
       }
-      await serveStatic(res, url.pathname);
+      await serveStatic(req, res, url.pathname);
     } catch (error) {
       if (!res.headersSent) sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
       else res.end();

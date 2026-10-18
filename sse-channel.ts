@@ -1,3 +1,5 @@
+import { canonicalizeJson, diffSessionSnapshots, type JsonValue } from "./web/session-sync.js";
+
 export type SseEvent = Record<string, unknown>;
 
 // Coalesce before serializing full histories, so a burst of tokens does not
@@ -44,6 +46,9 @@ export interface SseWritable {
 
 export interface SseClient {
   res: SseWritable;
+  sessionId?: string;
+  snapshotBaseline?: Record<string, JsonValue>;
+  snapshotRevision: number;
   waitingForDrain: boolean;
   pendingEvents: Map<string, SseEvent>;
   closed: boolean;
@@ -59,6 +64,7 @@ function eventKey(event: SseEvent): string {
 export function createSseClient(res: SseWritable, onError: () => void): SseClient {
   return {
     res,
+    snapshotRevision: 0,
     waitingForDrain: false,
     pendingEvents: new Map(),
     closed: false,
@@ -68,7 +74,24 @@ export function createSseClient(res: SseWritable, onError: () => void): SseClien
 
 function writeEvent(client: SseClient, event: SseEvent): boolean {
   try {
-    const accepted = client.res.write(`data: ${JSON.stringify(event)}\n\n`);
+    let outgoing = event;
+    const snapshot = event.type === "snapshot" ? event as Record<string, JsonValue> : undefined;
+    if (snapshot) {
+      const revision = client.snapshotRevision + 1;
+      if (client.snapshotBaseline && client.snapshotBaseline.sessionId === snapshot.sessionId) {
+        const patches = diffSessionSnapshots(client.snapshotBaseline, snapshot);
+        if (patches.length === 0) return true;
+        outgoing = { type: "session_patch", sessionId: snapshot.sessionId, baseRevision: client.snapshotRevision, revision, patches };
+      } else {
+        outgoing = { ...snapshot, revision };
+      }
+    }
+    const accepted = client.res.write(`data: ${JSON.stringify(outgoing)}\n\n`);
+    // A false return still means Node accepted the bytes into its buffer.
+    if (snapshot) {
+      client.snapshotBaseline = snapshot;
+      client.snapshotRevision++;
+    }
     if (accepted) return true;
     client.waitingForDrain = true;
     client.res.once("drain", () => flushPendingEvents(client));
@@ -93,7 +116,18 @@ function flushPendingEvents(client: SseClient): void {
 
 export function sendSseEvent(client: SseClient, event: SseEvent): void {
   if (client.closed) return;
+  if (event.type === "snapshot") {
+    try {
+      const { revision: _revision, ...body } = event;
+      event = canonicalizeJson(body) as Record<string, JsonValue>;
+    } catch {
+      closeSseClient(client);
+      client.onError();
+      return;
+    }
+  }
   if (client.waitingForDrain) {
+    // Snapshot entries are detached full targets, diffed only when written.
     // Keep only the newest event of each kind while the browser catches up.
     // This bounds memory even when snapshots contain a long conversation.
     client.pendingEvents.set(eventKey(event), event);
@@ -106,4 +140,6 @@ export function closeSseClient(client: SseClient): void {
   client.closed = true;
   client.waitingForDrain = false;
   client.pendingEvents.clear();
+  client.snapshotBaseline = undefined;
+  client.snapshotRevision = 0;
 }

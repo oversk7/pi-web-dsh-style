@@ -112,6 +112,65 @@ for (const [name, render] of [["source", markdown], ["browser bundle", browser.m
     assert.match(render('[`file.ts`](D:/project/file.ts)'), /<code>file.ts<\/code><\/a>/);
   });
 
+  test(`${name}: project document links open local previews instead of website paths`, () => {
+    for (const target of ["llmdoc/architecture/command-dispatch-optimization.md", "/llmdoc/architecture/command-dispatch-optimization.md", "./llmdoc/architecture/command-dispatch-optimization.md#L12", "../notes.md:7", "docs/My%20Notes.md"]) {
+      const html = render(`[Document](${target})`);
+      assert.match(html, /class="md-local-file"/);
+      assert.match(html, /href="\/api\/fs\/view\?path=/);
+      assert.doesNotMatch(html, /target="_blank"/);
+    }
+    assert.match(render("[Document](/llmdoc/note.md)"), /data-file-path="llmdoc\/note.md"/);
+    assert.match(render("[Document](docs/My%20Notes.md)"), /data-file-path="docs\/My Notes.md"/);
+    for (const target of ["https://example.com/note.md", "//example.com/note.md", "/api/status", "https://example.com/docs"]) {
+      assert.doesNotMatch(render(`[Website](${target})`), /md-local-file/);
+    }
+  });
+
+  test(`${name}: workspace context binds relative document links to absolute preview paths`, () => {
+    for (const target of ["llmdoc/architecture/command-dispatch-optimization.md", "/llmdoc/architecture/command-dispatch-optimization.md", "./llmdoc/architecture/command-dispatch-optimization.md"]) {
+      const html = render(`[Document](${target})`, { cwd: "D:\\QQbot\\GuiXiuXian2" });
+      assert.match(html, /data-file-path="D:\/QQbot\/GuiXiuXian2\/llmdoc\/architecture\/command-dispatch-optimization.md"/);
+      assert.ok(html.includes(`href="/api/fs/view?path=${encodeURIComponent("D:/QQbot/GuiXiuXian2/llmdoc/architecture/command-dispatch-optimization.md")}"`));
+    }
+    const html = render("[Document](../notes.md#L12)", { cwd: "D:/My Project/docs" });
+    assert.match(html, /data-file-path="D:\/My Project\/notes.md"/);
+    assert.match(html, /data-file-line="12"/);
+    assert.match(render("[Document](C:/other/note.md)", { cwd: "D:/project" }), /data-file-path="C:\/other\/note.md"/);
+    assert.doesNotMatch(render("[Website](https://example.com/note.md)", { cwd: "D:/project" }), /md-local-file/);
+  });
+
+  test(`${name}: formulas render dollars and bracket delimiters with accessible MathML`, () => {
+    for (const source of ["$E = mc^2$", String.raw`\(E = mc^2\)`, "$$\n\\frac{1}{2}\n$$", String.raw`\[\frac{1}{2}\]`]) {
+      const html = render(source);
+      assert.match(html, /class="katex"/);
+      assert.match(html, /<math /);
+      assert.match(html, /<annotation encoding="application\/x-tex">/);
+    }
+    assert.match(render("$$x^2$$"), /katex-display/);
+    assert.doesNotMatch(render("$x^2$"), /katex-display/);
+    assert.match(render("$$x^2$$"), /katex-display/);
+    assert.doesNotMatch(render("`$x$`\n\n```tex\n$x$\n```"), /class="katex"/);
+    assert.doesNotMatch(render(String.raw`\$5 and $10`), /class="katex"/);
+    assert.doesNotMatch(render("$unfinished"), /class="katex"/);
+    assert.match(render(String.raw`$\invalidcommand{x}$`), /\\invalidcommand/);
+    assert.match(render(String.raw`$\frac{1}$`), /katex-error/);
+    assert.doesNotMatch(render(String.raw`$\href{javascript:alert(1)}{click}$`), /href="javascript:/);
+    assert.doesNotMatch(render(String.raw`$\htmlClass{evil}{x}$`), /class="evil"/);
+  });
+
+  test(`${name}: Mermaid fences preserve escaped source and distinguish streaming completion`, () => {
+    const source = 'flowchart LR\nA["<script>alert(1)</script>"] --> B[Done]\n';
+    const complete = render("```mermaid\n" + source + "```");
+    assert.match(complete, /class="md-mermaid"/);
+    assert.match(complete, /data-mermaid-complete="true"/);
+    assert.match(complete, /&lt;script&gt;/);
+    assert.doesNotMatch(complete, /<script/);
+    assert.match(render("```mermaid\n" + source), /data-mermaid-complete="false"/);
+    assert.match(render("~~~mermaid\nflowchart LR\nA --> B\n~~~"), /data-mermaid-complete="true"/);
+    assert.match(render("> ```mermaid\n> flowchart LR\n> A --> B\n> ```"), /data-mermaid-complete="true"/);
+    assert.doesNotMatch(render("```text\nflowchart LR\nA --> B\n```"), /md-mermaid/);
+  });
+
   test(`${name}: raw HTML and unsafe URLs cannot create executable markup`, () => {
     const html = render('<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n[x](javascript:alert(1))\n\n![x](data:text/html;base64,PHNjcmlwdD4=)\n\n[x](jav&#x61;script:alert(1))');
     assert.doesNotMatch(html, /<script|<img|href="javascript:|src="data:text\/html/);

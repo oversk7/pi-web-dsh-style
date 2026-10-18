@@ -5,6 +5,32 @@ import { runInNewContext } from "node:vm";
 
 const app = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
 const composerSource = app.slice(app.indexOf("function syncComposerInput("), app.indexOf("function restoreDraft("));
+const viewportSource = app.slice(app.indexOf("function updateViewport("), app.indexOf("function closeMobileSidebar("));
+
+test("visible viewport follows keyboard opening, browser panning, and closing even when zoomed", () => {
+  const properties = new Map<string, string>();
+  const viewport = { height: 844, offsetTop: 0, scale: 1 };
+  const context = {
+    window: { visualViewport: viewport, innerHeight: 844 },
+    document: { documentElement: { style: { setProperty: (key: string, value: string) => properties.set(key, value) } } },
+  };
+  for (const [height, offsetTop, scale] of [[844, 0, 1], [480, 0, 1], [360, 80, 1.2], [844, 0, 1]]) {
+    Object.assign(viewport, { height, offsetTop, scale });
+    runInNewContext(`${viewportSource}\nupdateViewport()`, context);
+    assert.equal(properties.get("--pi-viewport-height"), `${height}px`);
+    assert.equal(properties.get("--pi-viewport-top"), `${offsetTop}px`);
+  }
+});
+
+test("viewport falls back to window height when VisualViewport is unavailable", () => {
+  const properties = new Map<string, string>();
+  runInNewContext(`${viewportSource}\nupdateViewport()`, {
+    window: { innerHeight: 480 },
+    document: { documentElement: { style: { setProperty: (key: string, value: string) => properties.set(key, value) } } },
+  });
+  assert.equal(properties.get("--pi-viewport-height"), "480px");
+  assert.equal(properties.get("--pi-viewport-top"), "0px");
+});
 
 for (const touch of [false, true]) {
   test(`Enter ${touch ? "inserts a newline on phones" : "sends on desktop"} and respects IME`, () => {

@@ -1,6 +1,10 @@
 "use strict";
 
-import { markdown } from "./assets/markdown.js";
+import { markdown as renderMarkdown } from "./assets/markdown.js";
+import { observeMarkdownDiagrams } from "./markdown-diagrams.js";
+import { applySessionPatches } from "./session-sync.js";
+
+observeMarkdownDiagrams();
 import { webSlashCommands, unsupportedSlashCommands, parseSlashCommand } from "./slash-commands.js";
 import { getLanguage, setLanguage, t, translateUi, observeUi } from "./i18n.js";
 
@@ -17,6 +21,8 @@ const S = {
   currentWorkspaceId: null,
   currentSessionId: null,
   snapshots: new Map(),
+  loadedSessions: new Set(),
+  sessionOpens: new Map(),
   newSessionSnapshot: null,
   newSessionPreferenceWorkspaceId: null,
   collapsed: new Set(),
@@ -105,8 +111,8 @@ async function api(path, options = {}) {
   return data;
 }
 
-function post(path, body) {
-  return api(path, { method: "POST", body: JSON.stringify(body || {}) });
+function post(path, body, options = {}) {
+  return api(path, { ...options, method: "POST", body: JSON.stringify(body || {}) });
 }
 
 function timeLabel(iso) {
@@ -274,6 +280,14 @@ function snapshotFor(id) {
   return S.snapshots.get(id) || { session: null, state: null, stats: null, models: [], thinkingLevels: [], thinkingLevelsByModel: {}, commands: [], extensionStatuses: {}, messages: [], pendingQueue: { steering: [], followUp: [] }, dialogs: [] };
 }
 
+function markdown(text) {
+  const session = S.currentSessionId ? S.snapshots.get(S.currentSessionId)?.session : null;
+  const workspace = S.currentSessionId
+    ? S.workspaces.find((item) => item.sessions?.some((entry) => entry.id === S.currentSessionId))
+    : S.workspaces.find((item) => item.id === S.currentWorkspaceId);
+  return renderMarkdown(text, { cwd: session?.cwd || workspace?.path });
+}
+
 function currentWorkspace() {
   return S.workspaces.find((w) => w.id === S.currentWorkspaceId) || S.workspaces[0] || null;
 }
@@ -429,7 +443,6 @@ function usesMobileFilePreview() {
 
 function updateViewport() {
   const viewport = window.visualViewport;
-  if (viewport && viewport.scale !== 1) return;
   document.documentElement.style.setProperty("--pi-viewport-height", `${viewport?.height || window.innerHeight}px`);
   document.documentElement.style.setProperty("--pi-viewport-top", `${viewport?.offsetTop || 0}px`);
 }
@@ -586,7 +599,8 @@ async function openFilePreview(path, line, href, trigger = document.activeElemen
   }
   const requestedLine = Number(line);
   const normalizedLine = Number.isFinite(requestedLine) && requestedLine > 0 ? Math.max(1, requestedLine) : null;
-  if (S.filePreview?.path === path && !S.filePreview.error) {
+  const previewContext = S.currentSessionId || S.currentWorkspaceId || "";
+  if ((S.filePreview?.requestedPath || S.filePreview?.path) === path && S.filePreview?.context === previewContext && !S.filePreview.error) {
     S.filePreview = { ...S.filePreview, line: normalizedLine, href };
     applyFrameLayout();
     renderFilePreview();
@@ -596,15 +610,17 @@ async function openFilePreview(path, line, href, trigger = document.activeElemen
   }
 
   const generation = ++S.filePreviewGeneration;
-  S.filePreview = { path, line: normalizedLine, href, name: fileNameFromPath(path), loading: true };
+  S.filePreview = { path, requestedPath: path, context: previewContext, line: normalizedLine, href, name: fileNameFromPath(path), loading: true };
   applyFrameLayout();
   renderFilePreview();
   if (mobile) $(".pI_x6G_detailsCol")?.focus({ preventScroll: true });
   try {
-    const data = await api(`/api/fs/view?path=${encodeURIComponent(path)}&format=json`);
+    const context = S.currentSessionId ? `&sessionId=${encodeURIComponent(S.currentSessionId)}`
+      : S.currentWorkspaceId ? `&workspaceId=${encodeURIComponent(S.currentWorkspaceId)}` : "";
+    const data = await api(`/api/fs/view?path=${encodeURIComponent(path)}&format=json${context}`);
     if (generation !== S.filePreviewGeneration) return;
     const activeLine = S.filePreview?.path === path ? S.filePreview.line : normalizedLine;
-    S.filePreview = { ...data, path, line: activeLine, href, loading: false, error: null };
+    S.filePreview = { ...data, path: data.path || path, requestedPath: path, context: previewContext, line: activeLine, href, loading: false, error: null };
   } catch (error) {
     if (generation !== S.filePreviewGeneration) return;
     S.filePreview = { ...S.filePreview, loading: false, error: error.message || String(error) };
@@ -1443,6 +1459,7 @@ function renderActive() {
 }
 
 function renderConversation() {
+  syncEventSubscription();
   const mount = $("#conversationMount");
   if (!mount) return;
   const previousInput = $("#composerInput");
@@ -3114,7 +3131,14 @@ async function openSession(id, opts = {}) {
   if (!opts.skipRemember) rememberCurrentDraft();
   const generation = ++S.openGeneration;
   S.currentSessionId = id;
-  S.loadingSession = opts.initialSnapshot ? null : id;
+  if (opts.initialSnapshot) {
+    S.snapshots.set(id, opts.initialSnapshot);
+    S.loadedSessions.add(id);
+  }
+  const before = S.snapshots.get(id);
+  const cached = S.loadedSessions.has(id) && before?.session?.id === id && !before.error;
+  S.loadingSession = cached ? null : id;
+  if (before?.session?.workspaceId) S.currentWorkspaceId = before.session.workspaceId;
   if (!opts.silent) {
     const key = draftKey(id);
     const savedDraft = S.drafts.get(key) || "";
@@ -3129,14 +3153,24 @@ async function openSession(id, opts = {}) {
   }
   renderSidebar();
   renderConversation();
+  let request = S.sessionOpens.get(id);
   try {
-    const data = opts.initialSnapshot ?? await post(`/api/sessions/${encodeURIComponent(id)}/open`);
-    S.snapshots.set(id, data);
+    if (!opts.initialSnapshot && !request) {
+      const promise = post(`/api/sessions/${encodeURIComponent(id)}/open`, {}, { signal: AbortSignal.timeout(15_000) })
+        .finally(() => { S.sessionOpens.delete(id); });
+      request = { promise, snapshot: before };
+      S.sessionOpens.set(id, request);
+    }
+    const data = opts.initialSnapshot ?? await request.promise;
+    if (S.snapshots.get(id) === (opts.initialSnapshot ? before : request.snapshot)) S.snapshots.set(id, data);
+    S.loadedSessions.add(id);
     if (generation !== S.openGeneration) return;
     const ws = data.session?.workspaceId;
     if (ws) S.currentWorkspaceId = ws;
   } catch (error) {
-    S.snapshots.set(id, { ...snapshotFor(id), session: { id, title: "会话", status: "error" }, error: String(error) });
+    if (!cached && S.snapshots.get(id) === (request ? request.snapshot : before)) {
+      S.snapshots.set(id, { ...snapshotFor(id), session: { id, title: "会话", status: "error" }, error: String(error) });
+    }
   } finally {
     if (generation === S.openGeneration) {
       S.loadingSession = null;
@@ -3244,6 +3278,7 @@ async function ensureWorkspaceThen(action) {
 let browser = null;
 let pickerResolve = null;
 let browserKeyHandler = null;
+let directoryRequest = null;
 
 async function adoptWorkspacePath(path) {
   const added = await post("/api/workspaces", { path });
@@ -3320,6 +3355,7 @@ function promptWorkspaceBrowse() {
 }
 
 function closeWorkspacePicker() {
+  directoryRequest = null;
   if (browserKeyHandler) {
     document.removeEventListener("keydown", browserKeyHandler);
     browserKeyHandler = null;
@@ -3353,8 +3389,42 @@ function draftDirectory(draft) {
 function readDraft(listing, draft) {
   const directory = draftDirectory(draft);
   if (directory === null) return { directory: null, tail: null };
-  const answers = directory === levelDirectory(listing);
+  const fold = (value) => separatorOf() === "\\" ? value.replaceAll("/", "\\").toLowerCase() : value;
+  const answers = fold(directory) === fold(levelDirectory(listing));
   return { directory, tail: answers ? draft.slice(directory.length) : null };
+}
+
+async function previewPathDraft(draft) {
+  const current = browser;
+  const request = {};
+  directoryRequest = request;
+  if (!current || current.pathDraft !== draft) return;
+  const listing = current.child ?? current.parent;
+  const directory = draftDirectory(draft);
+  current.error = null;
+  if (directory === null || (listing && readDraft(listing, draft).tail !== null)) {
+    current.loading = false;
+    renderBrowser();
+    return;
+  }
+  current.loading = true;
+  renderBrowser();
+  try {
+    const data = await api(`/api/fs/list?path=${encodeURIComponent(directory)}`);
+    if (browser !== current || directoryRequest !== request) return;
+    if (data.error) throw new Error(data.error);
+    current.parent = data;
+    current.selected = null;
+    current.child = null;
+    current.home = data.home || current.home;
+    current.loading = false;
+    renderBrowser();
+  } catch (error) {
+    if (browser !== current || directoryRequest !== request) return;
+    current.loading = false;
+    current.error = error.message || String(error);
+    renderBrowser();
+  }
 }
 
 function visibleEntries(entries, selectedPath, showHidden, filterPrefix) {
@@ -3395,6 +3465,9 @@ function browserTargetPath() {
 
 async function navigate(path) {
   if (!browser || !path) return;
+  const current = browser;
+  const request = {};
+  directoryRequest = request;
   browser.loading = true;
   browser.error = null;
   browser.selected = null;
@@ -3403,7 +3476,7 @@ async function navigate(path) {
   let target = null;
   try {
     const data = await api(`/api/fs/list?path=${encodeURIComponent(path)}`);
-    if (!browser) return;
+    if (browser !== current || directoryRequest !== request) return;
     if (data.error) throw new Error(data.error);
     target = data;
     browser.home = data.home || browser.home;
@@ -3412,7 +3485,7 @@ async function navigate(path) {
     browser.loading = false;
     renderBrowser();
   } catch (error) {
-    if (!browser) return;
+    if (browser !== current || directoryRequest !== request) return;
     browser.loading = false;
     browser.error = error.message || String(error);
     renderBrowser();
@@ -3425,7 +3498,7 @@ async function navigate(path) {
   if (!parentCrumb) return;
   try {
     const data = await api(`/api/fs/list?path=${encodeURIComponent(parentCrumb.path)}`);
-    if (!browser || data.error) return;
+    if (browser !== current || directoryRequest !== request || data.error) return;
     const sep = separatorOf();
     const fold = (value) => (sep === "\\" ? value.toLowerCase() : value);
     const match = (data.entries || []).find((entry) => fold(entry.path) === fold(target.path));
@@ -3441,6 +3514,10 @@ async function navigate(path) {
 
 async function selectEntry(entry) {
   if (!browser) return;
+  const current = browser;
+  const request = {};
+  directoryRequest = request;
+  browser.pathDraft = null;
   browser.selected = entry;
   browser.child = null;
   browser.loading = true;
@@ -3448,13 +3525,13 @@ async function selectEntry(entry) {
   renderBrowser();
   try {
     const data = await api(`/api/fs/list?path=${encodeURIComponent(entry.path)}`);
-    if (!browser) return;
+    if (browser !== current || directoryRequest !== request) return;
     if (data.error) throw new Error(data.error);
     browser.child = data;
     browser.loading = false;
     renderBrowser();
   } catch (error) {
-    if (!browser) return;
+    if (browser !== current || directoryRequest !== request) return;
     browser.loading = false;
     browser.error = error.message || String(error);
     browser.selected = null;
@@ -3479,6 +3556,8 @@ function openPathEditor() {
 
 function cancelPathEdit() {
   if (!browser) return;
+  directoryRequest = null;
+  browser.loading = false;
   browser.pathDraft = null;
   browser.error = null;
   renderBrowser();
@@ -3594,6 +3673,8 @@ function renderBrowser() {
       </div>
     </div>` : "";
 
+  const previousPathInput = $("#dbPathInput");
+  const pathSelection = previousPathInput ? [previousPathInput.selectionStart, previousPathInput.selectionEnd] : null;
   mount.innerHTML = `
     <div class="db-modal">
       <div class="db-modalMask" data-action="db-cancel"></div>
@@ -3620,10 +3701,9 @@ function renderBrowser() {
 
   const pathInput = $("#dbPathInput");
   if (pathInput) {
-    const start = pathInput.selectionStart;
-    const end = pathInput.selectionEnd;
+    const [start, end] = pathSelection ?? [pathInput.selectionStart, pathInput.selectionEnd];
     pathInput.focus();
-    if (start != null && end != null && start === end) pathInput.setSelectionRange(start, end);
+    if (start != null && end != null) pathInput.setSelectionRange(start, end);
     pathInput.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.isComposing) {
         event.preventDefault();
@@ -3638,7 +3718,7 @@ function renderBrowser() {
     pathInput.addEventListener("input", () => {
       const caret = pathInput.selectionStart ?? pathInput.value.length;
       b.pathDraft = pathInput.value;
-      renderBrowser();
+      void previewPathDraft(b.pathDraft);
       const next = $("#dbPathInput");
       if (next) next.setSelectionRange(caret, caret);
     });
@@ -4856,6 +4936,7 @@ async function onClick(ev) {
       ];
       await Promise.all(orphanedAttachments.map((attachment) => deleteAttachment(attachment.id)));
       S.snapshots.delete(sessionId);
+      S.loadedSessions.delete(sessionId);
       S.drafts.delete(sessionDraftKey);
       S.failedDrafts.delete(sessionId);
       S.attachmentDrafts.delete(sessionDraftKey);
@@ -5111,7 +5192,8 @@ let loginPromise;
 
 function requireLogin() {
   if (loginPromise) return loginPromise;
-  eventSource?.close();
+  let authenticated = false;
+  disconnectEvents();
   loginPromise = (async () => {
     let { passwordConfigured } = await api("/api/auth");
     const dialog = el(`<div class="pi-loginBackdrop">
@@ -5150,6 +5232,7 @@ function requireLogin() {
           input.value = "";
           dialog.remove();
           root.inert = false;
+          authenticated = true;
           resolve();
         } catch (error) {
           message.textContent = error.message || String(error);
@@ -5159,8 +5242,10 @@ function requireLogin() {
         }
       };
     });
-    if (eventSource) connectEvents();
-  })().finally(() => { loginPromise = null; });
+  })().finally(() => {
+    loginPromise = null;
+    if (authenticated && !document.hidden) connectEvents();
+  });
   return loginPromise;
 }
 
@@ -5168,6 +5253,17 @@ let eventSource;
 let eventWatchdog;
 let lastEventAt = 0;
 let resyncPending;
+
+function disconnectEvents() {
+  eventSource?.close();
+  eventSource = null;
+  clearInterval(eventWatchdog);
+}
+
+function syncEventSubscription() {
+  if (document.hidden || !eventSource || loginPromise) return;
+  if (eventSource.sessionId !== (S.currentSessionId || null)) connectEvents(false);
+}
 
 async function resyncAfterReconnect() {
   if (resyncPending) return resyncPending;
@@ -5187,7 +5283,7 @@ async function resyncAfterReconnect() {
       const data = await api(`/api/sessions/${encodeURIComponent(id)}/open`, {
         method: "POST", body: "{}", signal: AbortSignal.timeout(15_000),
       });
-      if (S.snapshots.get(id) === before) S.snapshots.set(id, data);
+      if (id === S.currentSessionId && generation === S.openGeneration && S.snapshots.get(id) === before) S.snapshots.set(id, data);
     } else if (id && generation === S.openGeneration) {
       rememberCurrentDraft();
       ++S.openGeneration;
@@ -5202,21 +5298,31 @@ async function resyncAfterReconnect() {
   return resyncPending;
 }
 
-function connectEvents() {
-  eventSource?.close();
-  const es = new EventSource("/api/events");
+function connectEvents(resync = true) {
+  disconnectEvents();
+  if (document.hidden || loginPromise) return;
+  const sessionId = S.currentSessionId || null;
+  const query = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+  const es = new EventSource(`/api/events${query}`);
+  es.sessionId = sessionId;
   eventSource = es;
+  let streamedSnapshot;
+  let streamRevision = 0;
+  let opened = false;
   lastEventAt = Date.now();
-  clearInterval(eventWatchdog);
   // Heartbeats arrive every 25s, including when the model is idle. Some mobile
   // networks leave a dead stream open without notifying EventSource.
   eventWatchdog = setInterval(() => {
-    if (document.hidden || loginPromise || eventSource !== es) return;
+    if (eventSource !== es || document.hidden || loginPromise) return;
     if (Date.now() - lastEventAt > 60_000) connectEvents();
   }, 5_000);
   es.onopen = () => {
+    if (eventSource !== es) return;
+    streamedSnapshot = undefined;
+    streamRevision = 0;
     lastEventAt = Date.now();
-    void resyncAfterReconnect();
+    if (resync || opened) void resyncAfterReconnect();
+    opened = true;
   };
   es.onmessage = (ev) => {
     if (eventSource !== es) return;
@@ -5252,11 +5358,30 @@ function connectEvents() {
         }
         return;
       }
-      if (event.type === "snapshot") {
-        if (!event.sessionId) return;
-        S.snapshots.set(event.sessionId, { ...snapshotFor(event.sessionId), ...event });
+      if (event.type === "snapshot" || event.type === "session_patch") {
+        if (!event.sessionId || event.sessionId !== es.sessionId || event.sessionId !== S.currentSessionId) return;
+        if (event.type === "snapshot") {
+          const { revision, ...snapshot } = event;
+          streamedSnapshot = snapshot;
+          streamRevision = revision;
+        } else {
+          if (!streamedSnapshot || event.baseRevision !== streamRevision || event.revision !== streamRevision + 1) {
+            connectEvents(false);
+            return;
+          }
+          try {
+            streamedSnapshot = applySessionPatches(streamedSnapshot, event.patches);
+          } catch {
+            connectEvents(false);
+            return;
+          }
+          streamRevision = event.revision;
+        }
+        S.snapshots.set(event.sessionId, { ...snapshotFor(event.sessionId), error: undefined, ...streamedSnapshot });
         const current = event.sessionId === S.currentSessionId;
-        queueRender(false, { sidebar: false, conversation: current, overlay: current });
+        // Settings do not depend on session snapshots. Rebuilding the panel on
+        // every streamed chunk replaces controls between pointerdown and click.
+        queueRender(false, { sidebar: false, conversation: current, overlay: false });
         return;
       }
       if (event.type === "workspaces") {
@@ -5279,21 +5404,24 @@ function connectEvents() {
           }
         }
         if (unchanged && !conversationChanged) return;
-        queueRender(false, { sidebar: true, conversation: conversationChanged, overlay: conversationChanged });
+        queueRender(false, { sidebar: true, conversation: conversationChanged, overlay: false });
       }
     } catch {
       // ignore malformed event
     }
   };
-  es.onerror = () => { void resyncAfterReconnect(); };
+  es.onerror = () => {
+    if (eventSource === es && !document.hidden) void resyncAfterReconnect();
+  };
 }
 
 window.addEventListener("resize", () => { updateViewport(); applyFrameLayout(); });
 window.visualViewport?.addEventListener("resize", updateViewport);
 window.visualViewport?.addEventListener("scroll", updateViewport);
-window.addEventListener("online", () => { if (eventSource && !loginPromise) connectEvents(); });
+window.addEventListener("online", () => { if (!document.hidden && !loginPromise) connectEvents(); });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && eventSource && !loginPromise) connectEvents();
+  if (document.hidden) disconnectEvents();
+  else if (!loginPromise) connectEvents();
 });
 setLanguage(getLanguage());
 observeUi();

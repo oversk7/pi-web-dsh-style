@@ -24,6 +24,7 @@ export const unsupportedSlashCommands = {
   trust: "项目信任设置需要在 Pi 终端中通过 /trust 管理。",
   changelog: "Web 暂不展示 Pi 更新日志，请在 Pi 终端执行 /changelog。",
   hotkeys: "终端快捷键不适用于网页。网页输入框支持 Enter 发送、Shift+Enter 换行，命令菜单支持方向键选择和 Tab 补全。",
+  bug: "Web 暂不支持提交问题报告，请在 Pi 终端执行 /bug。",
   debug: "此调试命令仅支持 Pi 终端。",
   arminsayshi: "此彩蛋命令仅支持 Pi 终端。",
   dementedelves: "此彩蛋命令仅支持 Pi 终端。",
